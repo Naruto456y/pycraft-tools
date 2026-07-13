@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as f:
 
 setup(
     name="pycraft-tools",
-    version="1.1.1",
+    version="1.1.2",
     author="Yusuf Guseinov",
     author_email="yusufvaleh@gmail.com",
     description="Универсальный помощник на Python: голос, музыка, автоматизация, базы данных, ИИ, скачивание музыки",
@@ -53,7 +53,7 @@ setup(
         "Pillow",
         "numpy",
         "psutil",
-        "youtube-search",
+        "youtube-search-python",
         "pyperclip",
         "PyPDF2",
         "plyer",

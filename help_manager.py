@@ -6,7 +6,7 @@
 📦 HELP_MANAGER.PY — УНИВЕРСАЛЬНЫЙ ПОМОЩНИК НА PYTHON
 ================================================================================
 Всё в одном файле: голос, базы данных, музыка, парсинг, автоматизация и ИИ.
-Версия: 1.1.0
+Версия: 1.1.2
 Автор: Юсуф
 ================================================================================
 """
@@ -739,7 +739,7 @@ class GigaChat:
 
 
 # =============================================================================
-# КЛАСС FolderUtils – РАБОТА С ПАПКАМИ И ФАЙЛАМИ
+# КЛАСС FolderUtils – РАБОТА С ФАЙЛОВОЙ СИСТЕМОЙ (РАСШИРЕННАЯ ВЕРСИЯ)
 # =============================================================================
 
 class FolderUtils:
@@ -747,13 +747,20 @@ class FolderUtils:
     📁 УТИЛИТЫ ДЛЯ РАБОТЫ С ФАЙЛОВОЙ СИСТЕМОЙ
 
     Все методы статические. Позволяют создавать, копировать, перемещать,
-    искать и получать информацию о файлах и папках.
+    переименовывать, искать и получать информацию о файлах и папках.
 
     📌 ПРИМЕРЫ:
         >>> FolderUtils.create("my_project/data")
+        >>> FolderUtils.rename("old.txt", "new.txt")
+        >>> FolderUtils.safe_move("file.txt", "backup/file.txt", overwrite=True)
+        >>> FolderUtils.move_files("src", "dst", "*.py", recursive=True)
         >>> all_py = FolderUtils.find_files(".", ".py")
         >>> size = FolderUtils.get_size("my_project")
     """
+
+    # -------------------------------------------------------------------------
+    # 📂 СОЗДАНИЕ И УДАЛЕНИЕ
+    # -------------------------------------------------------------------------
 
     @staticmethod
     def create(path: str) -> bool:
@@ -800,10 +807,14 @@ class FolderUtils:
             print(f"❌ Ошибка удаления: {e}")
             return False
 
+    # -------------------------------------------------------------------------
+    # 📦 ПЕРЕМЕЩЕНИЕ И КОПИРОВАНИЕ
+    # -------------------------------------------------------------------------
+
     @staticmethod
     def move(src: str, dst: str) -> bool:
         """
-        📦 ПЕРЕМЕЩЕНИЕ ФАЙЛА ИЛИ ПАПКИ
+        📦 ПЕРЕМЕЩЕНИЕ ФАЙЛА ИЛИ ПАПКИ (без проверок, просто перемещает)
 
         Параметры:
             src (str): Исходный путь
@@ -852,6 +863,214 @@ class FolderUtils:
             return False
 
     @staticmethod
+    def rename(src: str, new_name: str) -> bool:
+        """
+        📝 ПЕРЕИМЕНОВАНИЕ ФАЙЛА ИЛИ ПАПКИ (без перемещения в другой каталог)
+
+        Параметры:
+            src (str): Полный путь к файлу или папке.
+            new_name (str): Новое имя (только имя, без пути).
+
+        Возвращает:
+            bool: True при успехе, False при ошибке.
+
+        Пример:
+            >>> FolderUtils.rename("C:/data/old.txt", "new.txt")
+        """
+        try:
+            dirname = os.path.dirname(src)
+            new_path = os.path.join(dirname, new_name)
+            os.rename(src, new_path)
+            print(f"📝 Переименовано: {src} → {new_path}")
+            return True
+        except Exception as e:
+            print(f"❌ Ошибка переименования: {e}")
+            return False
+
+    @staticmethod
+    def safe_move(src: str, dst: str, overwrite: bool = False, create_dst_dir: bool = True) -> bool:
+        """
+        📦 БЕЗОПАСНОЕ ПЕРЕМЕЩЕНИЕ ФАЙЛА ИЛИ ПАПКИ (с проверкой перезаписи и созданием папки назначения)
+
+        Параметры:
+            src (str): Исходный путь.
+            dst (str): Путь назначения (может быть как новым именем, так и папкой).
+            overwrite (bool): Если True, перезаписывать существующий файл/папку.
+                              Если False, при конфликте добавляет суффикс "_copy".
+            create_dst_dir (bool): Если True, создаёт родительские папки назначения.
+
+        Возвращает:
+            bool: True при успехе, False при ошибке.
+
+        Пример:
+            >>> FolderUtils.safe_move("data.txt", "backup/data.txt", overwrite=True)
+            >>> FolderUtils.safe_move("project", "archive/project", overwrite=False)
+        """
+        try:
+            src = os.path.abspath(src)
+            dst = os.path.abspath(dst)
+
+            # Определяем, является ли dst папкой (если существует)
+            if os.path.exists(dst) and os.path.isdir(dst):
+                # Если dst - папка, то перемещаем внутрь с сохранением имени
+                dst_path = os.path.join(dst, os.path.basename(src))
+            else:
+                dst_path = dst
+
+            # Создаём родительские папки для dst_path, если нужно
+            if create_dst_dir:
+                dst_dir = os.path.dirname(dst_path)
+                if dst_dir and not os.path.exists(dst_dir):
+                    os.makedirs(dst_dir, exist_ok=True)
+
+            # Обработка конфликта, если файл уже существует
+            if os.path.exists(dst_path):
+                if overwrite:
+                    # Если папка, удаляем её (осторожно!)
+                    if os.path.isdir(dst_path):
+                        shutil.rmtree(dst_path)
+                    else:
+                        os.remove(dst_path)
+                else:
+                    # Добавляем суффикс "_copy" к имени
+                    base, ext = os.path.splitext(dst_path)
+                    counter = 1
+                    while True:
+                        new_dst = f"{base}_copy{counter}{ext}"
+                        if not os.path.exists(new_dst):
+                            dst_path = new_dst
+                            break
+                        counter += 1
+                    print(f"⚠️ Конфликт, сохранено как: {dst_path}")
+
+            # Перемещение
+            shutil.move(src, dst_path)
+            print(f"📦 Перемещено: {src} → {dst_path}")
+            return True
+
+        except Exception as e:
+            print(f"❌ Ошибка безопасного перемещения: {e}")
+            return False
+
+    @staticmethod
+    def move_files(src_dir: str, dst_dir: str, pattern: Optional[str] = None,
+                   recursive: bool = False) -> int:
+        """
+        📁 ГРУППОВОЕ ПЕРЕМЕЩЕНИЕ ФАЙЛОВ ПО МАСКЕ
+
+        Параметры:
+            src_dir (str): Исходная папка.
+            dst_dir (str): Папка назначения (будет создана, если не существует).
+            pattern (str, optional): Маска файлов (например, "*.txt", "data_*.csv").
+                                    Если None, перемещаются все файлы.
+            recursive (bool): Если True, обрабатывает вложенные папки рекурсивно.
+
+        Возвращает:
+            int: Количество перемещённых файлов.
+
+        Пример:
+            >>> FolderUtils.move_files("downloads", "archive", "*.pdf")
+            >>> FolderUtils.move_files("src", "backup", "*.py", recursive=True)
+        """
+        import fnmatch
+
+        try:
+            src_dir = os.path.abspath(src_dir)
+            dst_dir = os.path.abspath(dst_dir)
+
+            if not os.path.isdir(src_dir):
+                raise NotADirectoryError(f"Исходная папка не существует: {src_dir}")
+
+            os.makedirs(dst_dir, exist_ok=True)
+
+            count = 0
+            # Рекурсивный или нерекурсивный обход
+            for root, dirs, files in os.walk(src_dir):
+                for file in files:
+                    # Проверка маски
+                    if pattern is not None:
+                        if not fnmatch.fnmatch(file, pattern):
+                            continue
+
+                    src_path = os.path.join(root, file)
+                    # Если recursive=False, пропускаем файлы в подпапках
+                    if not recursive and root != src_dir:
+                        continue
+
+                    # Относительный путь для сохранения структуры (при recursive=True)
+                    rel_path = os.path.relpath(root, src_dir) if recursive else ""
+                    dst_path = os.path.join(dst_dir, rel_path, file) if rel_path else os.path.join(dst_dir, file)
+
+                    # Создаём папку назначения для файла
+                    dst_subdir = os.path.dirname(dst_path)
+                    if dst_subdir:
+                        os.makedirs(dst_subdir, exist_ok=True)
+
+                    shutil.move(src_path, dst_path)
+                    count += 1
+                    print(f"   → {src_path} -> {dst_path}")
+
+            print(f"📁 Перемещено файлов: {count}")
+            return count
+
+        except Exception as e:
+            print(f"❌ Ошибка группового перемещения: {e}")
+            return 0
+
+    @staticmethod
+    def move_folder(src: str, dst: str, overwrite: bool = False) -> bool:
+        """
+        📂 ПЕРЕМЕЩЕНИЕ ЦЕЛОЙ ПАПКИ (с контролем перезаписи)
+
+        Параметры:
+            src (str): Исходный путь к папке.
+            dst (str): Путь назначения (новая папка или родительская папка).
+            overwrite (bool): Если True, перезаписывает существующую папку.
+
+        Возвращает:
+            bool: True при успехе, False при ошибке.
+
+        Пример:
+            >>> FolderUtils.move_folder("project_old", "project_new", overwrite=True)
+        """
+        try:
+            src = os.path.abspath(src)
+            dst = os.path.abspath(dst)
+
+            if not os.path.isdir(src):
+                raise NotADirectoryError(f"Исходная папка не существует: {src}")
+
+            # Если dst уже существует как папка, перемещаем внутрь
+            if os.path.exists(dst) and os.path.isdir(dst):
+                # Если dst - папка, перемещаем src внутрь
+                dst_path = os.path.join(dst, os.path.basename(src))
+            else:
+                dst_path = dst
+
+            # Если папка назначения уже существует и overwrite=True, удаляем её
+            if os.path.exists(dst_path):
+                if overwrite:
+                    if os.path.isdir(dst_path):
+                        shutil.rmtree(dst_path)
+                    else:
+                        os.remove(dst_path)
+                else:
+                    raise FileExistsError(f"Папка назначения уже существует: {dst_path}")
+
+            # Перемещаем (shutil.move работает и с папками)
+            shutil.move(src, dst_path)
+            print(f"📂 Папка перемещена: {src} → {dst_path}")
+            return True
+
+        except Exception as e:
+            print(f"❌ Ошибка перемещения папки: {e}")
+            return False
+
+    # -------------------------------------------------------------------------
+    # 🔍 ПОИСК И ОБХОД
+    # -------------------------------------------------------------------------
+
+    @staticmethod
     def find_files(directory: str, extension: Optional[str] = None) -> List[str]:
         """
         🔍 ПОИСК ФАЙЛОВ В ПАПКЕ И ВЛОЖЕННЫХ ПАПКАХ
@@ -891,6 +1110,10 @@ class FolderUtils:
                 result.append(os.path.join(root, d))
         print(f"📁 Найдено {len(result)} подпапок")
         return result
+
+    # -------------------------------------------------------------------------
+    # ℹ️ ИНФОРМАЦИЯ О ФАЙЛАХ И ПУТЯХ
+    # -------------------------------------------------------------------------
 
     @staticmethod
     def current_dir() -> str:
@@ -1031,7 +1254,6 @@ class FolderUtils:
         except Exception as e:
             print(f"❌ Ошибка чтения папки: {e}")
         return {"files": files, "folders": folders}
-
 
 # =============================================================================
 # КЛАСС Console – РАБОТА С КОНСОЛЬЮ
@@ -3223,6 +3445,198 @@ class UnitConverter:
         """
         return lbs / 2.20462
 
+# =============================================================================
+# КЛАСС ImportManager – УПРОЩЁННАЯ РАБОТА С ИМПОРТАМИ
+# =============================================================================
+
+class ImportManager:
+    """
+    📦 УПРАВЛЕНИЕ ИМПОРТАМИ С ПОДДЕРЖКОЙ АБСОЛЮТНЫХ ПУТЕЙ
+
+    Предоставляет статические методы для:
+        - Добавления каталогов в sys.path
+        - Импорта модулей по полному пути к файлу
+        - Получения абсолютного пути относительно вызывающего скрипта
+        - Временного добавления путей (контекстный менеджер)
+
+    📌 ПРИМЕРЫ:
+        >>> # Добавить папку в sys.path
+        >>> ImportManager.add_path("C:/my_libs")
+        >>> 
+        >>> # Импортировать модуль из произвольного файла
+        >>> my_module = ImportManager.import_module("C:/project/utils.py")
+        >>> 
+        >>> # Получить абсолютный путь относительно текущего скрипта
+        >>> abs_path = ImportManager.get_absolute_path("data/config.json")
+        >>> 
+        >>> # Временно добавить путь
+        >>> with ImportManager.temp_path("C:/temp_libs"):
+        ...     import temp_module
+    """
+
+    _original_path = None
+
+    @staticmethod
+    def add_path(path: str) -> None:
+        """
+        ➕ ДОБАВЛЯЕТ КАТАЛОГ В sys.path (если его там ещё нет)
+
+        Параметры:
+            path (str): Путь к каталогу (абсолютный или относительный)
+        """
+        abs_path = os.path.abspath(path)
+        if abs_path not in sys.path:
+            sys.path.insert(0, abs_path)
+            print(f"📂 Добавлен путь в sys.path: {abs_path}")
+
+    @staticmethod
+    def remove_path(path: str) -> None:
+        """
+        ➖ УДАЛЯЕТ КАТАЛОГ ИЗ sys.path
+
+        Параметры:
+            path (str): Путь к каталогу
+        """
+        abs_path = os.path.abspath(path)
+        if abs_path in sys.path:
+            sys.path.remove(abs_path)
+            print(f"🗑️ Удалён путь из sys.path: {abs_path}")
+
+    @staticmethod
+    def import_module(file_path: str, module_name: Optional[str] = None):
+        """
+        📥 ИМПОРТИРУЕТ МОДУЛЬ ПО ПОЛНОМУ ПУТИ К ФАЙЛУ
+
+        Параметры:
+            file_path (str): Полный путь к .py файлу
+            module_name (str, optional): Имя модуля (если не указано, берётся из имени файла)
+
+        Возвращает:
+            module: Загруженный модуль
+
+        Пример:
+            >>> utils = ImportManager.import_module("C:/project/utils.py")
+            >>> utils.some_function()
+        """
+        import importlib.util
+        file_path = os.path.abspath(file_path)
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"Файл не найден: {file_path}")
+
+        if module_name is None:
+            module_name = os.path.splitext(os.path.basename(file_path))[0]
+
+        spec = importlib.util.spec_from_file_location(module_name, file_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Не удалось создать spec для {file_path}")
+
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        # Добавляем модуль в sys.modules, чтобы он был доступен по имени
+        sys.modules[module_name] = module
+        print(f"✅ Импортирован модуль: {module_name} из {file_path}")
+        return module
+
+    @staticmethod
+    def get_absolute_path(relative_path: str, stack_level: int = 1) -> str:
+        """
+        📂 ВОЗВРАЩАЕТ АБСОЛЮТНЫЙ ПУТЬ ОТНОСИТЕЛЬНО ВЫЗЫВАЮЩЕГО СКРИПТА
+
+        Параметры:
+            relative_path (str): Относительный путь (например, "data/config.json")
+            stack_level (int): Уровень в стеке вызовов (1 — вызывающий скрипт, 2 — его вызывающий и т.д.)
+
+        Возвращает:
+            str: Абсолютный путь
+
+        Пример:
+            # В файле my_script.py:
+            >>> config_path = ImportManager.get_absolute_path("config.json")
+            >>> print(config_path)  # C:/my_project/config.json
+        """
+        # Получаем файл вызывающего скрипта
+        frame = inspect.stack()[stack_level]
+        caller_file = frame.filename
+        caller_dir = os.path.dirname(os.path.abspath(caller_file))
+        return os.path.join(caller_dir, relative_path)
+
+    @staticmethod
+    def get_caller_dir(stack_level: int = 1) -> str:
+        """
+        📁 ВОЗВРАЩАЕТ ПАПКУ ВЫЗЫВАЮЩЕГО СКРИПТА
+
+        Параметры:
+            stack_level (int): Уровень в стеке вызовов
+
+        Возвращает:
+            str: Путь к папке вызывающего скрипта
+        """
+        frame = inspect.stack()[stack_level]
+        caller_file = frame.filename
+        return os.path.dirname(os.path.abspath(caller_file))
+
+    @staticmethod
+    def temp_path(path: str):
+        """
+        ⏳ КОНТЕКСТНЫЙ МЕНЕДЖЕР ДЛЯ ВРЕМЕННОГО ДОБАВЛЕНИЯ ПУТИ В sys.path
+
+        Параметры:
+            path (str): Путь для временного добавления
+
+        Пример:
+            >>> with ImportManager.temp_path("C:/temp_libs"):
+            ...     import temp_module
+        """
+        class TempPathManager:
+            def __enter__(self):
+                ImportManager.add_path(path)
+                return self
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                ImportManager.remove_path(path)
+
+        return TempPathManager()
+
+    @staticmethod
+    def import_from_folder(folder_path: str, module_name: str):
+        """
+        📁 ИМПОРТ:ИРУЕТ МОДУЛЬ ИЗ УКАЗАННОЙ ПАПКИ (без добавления в sys.path)
+
+        Параметры
+            folder_path (str): Путь к папке с модулем
+            module_name (str): Имя модуля (без .py)
+
+        Возвращает:
+            module: Загруженный модуль
+
+        Пример:
+            >>> my_mod = ImportManager.import_from_folder("C:/my_package", "mymodule")
+        """
+        file_path = os.path.join(folder_path, f"{module_name}.py")
+        return ImportManager.import_module(file_path, module_name)
+
+    @staticmethod
+    def import_relative(relative_path: str, base_file: Optional[str] = None):
+        """
+        📥 ИМПОРТ МОДУЛЯ ОТНОСИТЕЛЬНО ЗАДАННОГО ФАЙЛА (или вызывающего скрипта)
+
+        Параметры:
+            relative_path (str): Путь относительно base_file (или вызывающего скрипта)
+            base_file (str, optional): Базовый файл (если не указан, используется вызывающий скрипт)
+
+        Возвращает:
+            module: Загруженный модуль
+
+        Пример:
+            # В my_script.py:
+            >>> utils = ImportManager.import_relative("../../utils/helper.py")
+        """
+        if base_file is None:
+            base_file = inspect.stack()[1].filename
+        base_dir = os.path.dirname(os.path.abspath(base_file))
+        abs_path = os.path.normpath(os.path.join(base_dir, relative_path))
+        return ImportManager.import_module(abs_path)
+
 
 # =============================================================================
 # ТОЧКА ВХОДА ПРИ ЗАПУСКЕ ФАЙЛА НАПРЯМУЮ
@@ -3233,9 +3647,9 @@ if __name__ == "__main__":
     Блок для тестирования модуля при его прямом запуске.
     При импорте модуля этот код не выполняется.
     """
-    print("=" * 60)
+    print("=" * 70)
     print("📦 МОДУЛЬ HELP_MANAGER v1.1.0")
-    print("=" * 60)
+    print("=" * 70)
     print("✅ Модуль успешно загружен!")
     print()
     print("📌 БЫСТРЫЕ ПРИМЕРЫ ИСПОЛЬЗОВАНИЯ:")
@@ -3268,6 +3682,12 @@ if __name__ == "__main__":
     print("  ai = GigaChat(client_id='...', client_secret='...')")
     print("  answer = ai.chat('Расскажи шутку')")
     print()
-    print("=" * 60)
+    print("  # Импорты")
+    print("  ImportManager.add_path('C:/my_libs')")
+    print("  my_module = ImportManager.import_module('C:/project/utils.py')")
+    print("  with ImportManager.temp_path('C:/temp'):")
+    print("      import temp_module")
+    print()
+    print("=" * 70)
     print("📖 Подробная документация: https://pypi.org/project/pycraft-tools/")
-    print("=" * 60) 
+    print("=" * 70) 
