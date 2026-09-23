@@ -604,7 +604,7 @@ class GigaChat:
         - clean_speech(): очистка речи от шумов и повторов
     """
 
-    def __init__(self, client_id: Optional[str] = None, client_secret: Optional[str] = None, verify_ssl: bool = True):
+    def __init__(self, client_id: Optional[str] = None, client_secret: Optional[str] = None, verify_ssl: bool = False):
         """
         Инициализация клиента GigaChat.
 
