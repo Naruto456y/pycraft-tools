@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as f:
 
 setup(
     name="pycraft-tools",
-    version="1.1.3",
+    version="1.2.0",
     author="Yusuf Guseinov",
     author_email="yusufvaleh@gmail.com",
     description="Универсальный помощник на Python: голос, музыка, автоматизация, базы данных, ИИ, скачивание музыки",
@@ -14,6 +14,8 @@ setup(
     long_description_content_type="text/markdown",
     url="https://github.com/Naruto456y/help-tools",
     py_modules=["help_manager"],
+    packages=["yandex_smart_home", "makerzoid_robot", "yandex_music_tools", "voice_recognition", "neural_networks"],
+    extras_require={"gigaam": ["onnx-asr"], "vosk": ["vosk", "pyaudio"]},
     classifiers=[
         "Programming Language :: Python :: 3",
         "Programming Language :: Python :: 3.7",
@@ -57,5 +59,6 @@ setup(
         "pyperclip",
         "PyPDF2",
         "plyer",
+        "bleak",
     ],
 )

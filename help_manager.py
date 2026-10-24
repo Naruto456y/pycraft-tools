@@ -587,24 +587,84 @@ class Manager:
 # КЛАСС GigaChat – ИИ ОТ СБЕРБАНКА
 # =============================================================================
 
+class GigaChatError(Exception):
+    """
+    ❌ ОШИБКА API GigaChat
+
+    Наследует Exception, поэтому старый код с except Exception продолжает работать.
+
+    Атрибуты:
+        status_code (int или None): HTTP-код ответа (401, 422, 429...)
+        body (str или None): Тело ответа сервера
+
+    📌 ПРИМЕР:
+        >>> try:
+        ...     ai.chat("Привет")
+        ... except GigaChatError as e:
+        ...     print(e.status_code, e)
+    """
+
+    def __init__(self, message: str, status_code: Optional[int] = None, body: Optional[str] = None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.body = body
+
+
 class GigaChat:
     """
-    🤖 ИНТЕГРАЦИЯ С GigaChat (СБЕР) ДЛЯ ОБЩЕНИЯ И ОЧИСТКИ РЕЧИ
+    🤖 ИНТЕГРАЦИЯ С GigaChat (СБЕР): ЧАТ, ИЗОБРАЖЕНИЯ, ФАЙЛЫ, ТОКЕНЫ И ОЧИСТКА РЕЧИ
 
-    Класс позволяет отправлять запросы к нейросети GigaChat, а также
-    автоматически исправлять распознанную речь (убирать заикания, слова-паразиты).
+    Класс позволяет общаться с нейросетью GigaChat (с памятью диалога и потоковым ответом),
+    отправлять изображения и документы, получать описание картинок, генерировать изображения,
+    считать токены и автоматически исправлять распознанную речь (убирать заикания, слова-паразиты).
+
+    Токен доступа живёт 30 минут: класс сам обновляет его и повторяет запрос при ошибке 401.
 
     📌 ПРИМЕР:
         >>> ai = GigaChat(client_id="your_id", client_secret="your_secret")
         >>> answer = ai.chat("Как дела?")
         >>> cleaned = ai.clean_speech("я э-э-э хочу пиццу")
+        >>> print(ai.describe_image("photo.jpg"))
+        >>> print(ai.ask_image("Сколько людей на фото?", "photo.jpg"))
 
     🎯 ОСНОВНЫЕ МЕТОДЫ:
-        - chat(): общение с ИИ
+        - chat(): общение с ИИ (параметры модели, память, картинки, файлы)
+        - chat_stream(): ответ по кусочкам, по мере генерации
+        - ask_image() / describe_image(): вопрос по изображению и его описание
+        - generate_image(): создание изображения по тексту
         - clean_speech(): очистка речи от шумов и повторов
+        - upload_file() / list_files() / get_file_info() / download_file() / delete_file(): файлы
+        - count_tokens() / get_balance() / list_models() / embeddings(): служебные функции
+        - reset_history(): очистить память диалога
+
+    🔑 ДОСТУП:
+        client_id + client_secret ИЛИ готовый «ключ авторизации» (credentials) из кабинета Сбера.
+        Переменные окружения: GIGACHAT_CLIENT_ID, GIGACHAT_CLIENT_SECRET, GIGACHAT_CREDENTIALS.
     """
 
-    def __init__(self, client_id: Optional[str] = None, client_secret: Optional[str] = None, verify_ssl: bool = False):
+    API_URL = "https://gigachat.devices.sberbank.ru/api/v1"     # Прежний адрес (работает)
+    API_URL_NEW = "https://api.giga.chat/v1"                     # Новый адрес из документации Сбера
+    AUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
+
+    MAX_IMAGE_BYTES = 15 * 1024 * 1024     # Лимит изображения — 15 МБ
+    MAX_FILE_BYTES = 40 * 1024 * 1024      # Лимит текстового документа — 40 МБ
+    MAX_IMAGES = 10                        # Не больше 10 изображений в одном запросе
+    IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".gif", ".webp")
+
+    IMAGE_PROMPTS = {
+        "brief": "Опиши изображение одним-двумя предложениями.",
+        "detailed": "Подробно опиши, что изображено на картинке: объекты, людей, цвета, обстановку и надписи.",
+        "alt": "Напиши короткий alt-текст для этого изображения (до 120 символов).",
+        "text": "Перепиши весь текст, который виден на изображении. Если текста нет — так и скажи.",
+        "objects": "Перечисли списком все объекты, которые есть на изображении.",
+    }
+
+    def __init__(self, client_id: Optional[str] = None, client_secret: Optional[str] = None,
+                 verify_ssl: bool = False, *, credentials: Optional[str] = None,
+                 model: str = "GigaChat", scope: str = "GIGACHAT_API_PERS",
+                 base_url: Optional[str] = None, auth_url: Optional[str] = None,
+                 timeout: int = 30, ca_bundle: Optional[str] = None, system_prompt: str = "",
+                 remember: bool = False, max_history: int = 20, max_retries: int = 2):
         """
         Инициализация клиента GigaChat.
 
@@ -614,17 +674,74 @@ class GigaChat:
             client_secret (str, optional): Секрет клиента.
                                            По умолчанию из переменной окружения GIGACHAT_CLIENT_SECRET.
             verify_ssl (bool): Проверять SSL-сертификаты (True — безопасно, False — только для отладки).
+            credentials (str, optional): Готовый ключ авторизации (Base64 от client_id:client_secret).
+                                         Вместо пары client_id/client_secret. Или переменная GIGACHAT_CREDENTIALS.
+            model (str): Модель по умолчанию ('GigaChat', 'GigaChat-2-Max' и др., список: list_models()).
+            scope (str): Тип доступа: 'GIGACHAT_API_PERS' (физлица), 'GIGACHAT_API_B2B', 'GIGACHAT_API_CORP'.
+            base_url (str, optional): Адрес API. Новый адрес Сбера: GigaChat.API_URL_NEW ('https://api.giga.chat/v1').
+            auth_url (str, optional): Адрес получения токена (по умолчанию GigaChat.AUTH_URL).
+            timeout (int): Таймаут запросов в секундах.
+            ca_bundle (str, optional): Путь к сертификату Минцифры (.cer/.pem) для проверки SSL вместо verify_ssl.
+            system_prompt (str): Системный промпт по умолчанию для всех запросов.
+            remember (bool): True — запоминать диалог (история подставляется в каждый запрос).
+            max_history (int): Сколько последних сообщений хранить в памяти диалога.
+            max_retries (int): Сколько раз повторять запрос при 429/502/503/504.
 
         Исключения:
-            ValueError: Если client_id или client_secret не указаны и не найдены в окружении.
+            ValueError: Если ни client_id/client_secret, ни credentials не указаны и не найдены в окружении.
         """
+        import uuid
         self.client_id = client_id or os.environ.get("GIGACHAT_CLIENT_ID")
         self.client_secret = client_secret or os.environ.get("GIGACHAT_CLIENT_SECRET")
+        self.credentials = credentials
+        if not self.credentials and not (self.client_id and self.client_secret):
+            self.credentials = os.environ.get("GIGACHAT_CREDENTIALS")
         self.verify_ssl = verify_ssl
-        self._token = None
 
-        if not self.client_id or not self.client_secret:
-            raise ValueError("Токены не найдены. Передайте client_id/client_secret или задайте переменные окружения GIGACHAT_CLIENT_ID и GIGACHAT_CLIENT_SECRET.")
+        if not self.credentials and (not self.client_id or not self.client_secret):
+            raise ValueError("Токены не найдены. Передайте client_id/client_secret (или credentials) или задайте переменные окружения GIGACHAT_CLIENT_ID и GIGACHAT_CLIENT_SECRET (или GIGACHAT_CREDENTIALS).")
+
+        self.model = model
+        self.scope = scope
+        self.base_url = (base_url or self.API_URL).rstrip("/")
+        self.auth_url = auth_url or self.AUTH_URL
+        self.timeout = timeout
+        self.ca_bundle = ca_bundle
+        self.system_prompt = system_prompt
+        self.remember = remember
+        self.max_history = max_history
+        self.max_retries = max_retries
+
+        self.session_id = str(uuid.uuid4())      # Один ID сессии на весь диалог
+        self.history: List[Dict[str, Any]] = []  # Память диалога (без системного промпта)
+        self.last_usage: Optional[Dict[str, Any]] = None     # Токены последнего ответа
+        self.last_response: Optional[Dict[str, Any]] = None  # Полный JSON последнего ответа
+        self.last_files: List[str] = []          # ID файлов, приложенных к последнему запросу
+        self._token = None
+        self._token_expires_at = 0.0
+        self._file_cache: Dict[Any, str] = {}    # Чтобы не загружать одну картинку дважды
+        self._image_ids: set = set()
+
+    # ---------- Внутренние методы ----------
+
+    def _verify(self):
+        """Что передавать в requests как verify (внутренний метод)."""
+        return self.ca_bundle if self.ca_bundle else self.verify_ssl
+
+    def _silence_ssl_warnings(self) -> None:
+        """Отключает предупреждения urllib3, если SSL не проверяется (внутренний метод)."""
+        if not self.verify_ssl and not self.ca_bundle:
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    @staticmethod
+    def _parse_expires(value: Any) -> float:
+        """Время окончания токена в секундах Unix (внутренний метод)."""
+        try:
+            moment = float(value)
+            return moment / 1000.0 if moment > 1e11 else moment    # Сбер отдаёт миллисекунды
+        except (TypeError, ValueError):
+            return time.time() + 1700                               # Токен живёт 30 минут
 
     def _get_token(self) -> None:
         """Получает токен доступа к API GigaChat (внутренний метод)."""
@@ -632,77 +749,325 @@ class GigaChat:
         import uuid
         from urllib.parse import urlencode
         import requests
-        if not self.verify_ssl:
-            import urllib3
-            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        self._silence_ssl_warnings()
 
-        credentials = f"{self.client_id}:{self.client_secret}"
-        encoded = base64.b64encode(credentials.encode()).decode()
-        url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
+        key = self.credentials or base64.b64encode(f"{self.client_id}:{self.client_secret}".encode()).decode()
         headers = {
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json",
-            "Authorization": f"Basic {encoded}",
+            "Authorization": f"Basic {key}",
             "RqUID": str(uuid.uuid4()),
         }
-        data = {"scope": "GIGACHAT_API_PERS"}
+        data = {"scope": self.scope}
 
-        resp = requests.post(url, headers=headers, data=urlencode(data),
-                             verify=self.verify_ssl, timeout=30)
+        resp = requests.post(self.auth_url, headers=headers, data=urlencode(data),
+                             verify=self._verify(), timeout=self.timeout)
         if resp.status_code == 200:
-            self._token = resp.json().get("access_token")
+            payload = resp.json()
+            self._token = payload.get("access_token")
+            self._token_expires_at = self._parse_expires(payload.get("expires_at"))
         else:
-            raise Exception(f"Ошибка получения токена: {resp.status_code} - {resp.text}")
+            raise GigaChatError(f"Ошибка получения токена: {resp.status_code} - {resp.text}",
+                                resp.status_code, resp.text)
 
-    def chat(self, user_text: str, system_text: str = "", temperature: float = 0.7, max_tokens: int = 500) -> str:
+    def _ensure_token(self) -> None:
+        """Обновляет токен, если его нет или он скоро истечёт (внутренний метод)."""
+        if not self._token or time.time() >= self._token_expires_at - 60:
+            self._get_token()
+
+    def _request(self, method: str, path: str, *, json_body: Optional[Dict] = None,
+                 files: Optional[Dict] = None, data: Optional[Dict] = None,
+                 stream: bool = False, timeout: Optional[int] = None):
+        """
+        Запрос к API с токеном, обновлением при 401 и повтором при 429/502/503/504 (внутренний метод).
+
+        Исключения:
+            GigaChatError: Если сервер вернул ошибку.
+        """
+        import requests
+        self._silence_ssl_warnings()
+        refreshed = False
+        attempt = 0
+        while True:
+            self._ensure_token()
+            headers = {"Authorization": f"Bearer {self._token}", "X-Session-ID": self.session_id}
+            resp = requests.request(method, f"{self.base_url}{path}", headers=headers, json=json_body,
+                                    files=files, data=data, stream=stream, verify=self._verify(),
+                                    timeout=timeout or self.timeout)
+            if resp.status_code == 401 and not refreshed:
+                refreshed = True
+                self._token = None            # Токен протух — получим новый и повторим
+                continue
+            if resp.status_code in (429, 502, 503, 504) and attempt < self.max_retries:
+                attempt += 1
+                try:
+                    delay = float(resp.headers.get("Retry-After", 2 ** attempt))
+                except ValueError:
+                    delay = 2 ** attempt
+                time.sleep(min(delay, 30))
+                continue
+            if resp.status_code >= 400:
+                raise GigaChatError(f"GigaChat API error {resp.status_code}: {resp.text}",
+                                    resp.status_code, resp.text)
+            return resp
+
+    @staticmethod
+    def _as_list(value: Any) -> List[Any]:
+        """None → [], одиночное значение → [значение] (внутренний метод)."""
+        if value is None:
+            return []
+        return list(value) if isinstance(value, (list, tuple)) else [value]
+
+    def _resolve_file(self, item: Any) -> str:
+        """Путь, ссылка или готовый ID файла → ID файла в хранилище (внутренний метод)."""
+        import re
+        text = str(item)
+        if re.fullmatch(r"[0-9a-fA-F-]{36}", text) and not os.path.exists(text):
+            return text                                    # Это уже ID загруженного файла
+        if text.lower().startswith(("http://", "https://")):
+            import requests
+            reply = requests.get(text, timeout=self.timeout)
+            reply.raise_for_status()
+            name = os.path.basename(text.split("?")[0]) or "image.jpg"
+            suffix = os.path.splitext(name)[1] or ".jpg"
+            fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(reply.content)
+                return self.upload_file(tmp_path)
+            finally:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+        return self.upload_file(text)
+
+    def _user_messages(self, user_text: str, images: Any, files: Any) -> List[Dict[str, Any]]:
+        """Собирает сообщения пользователя с вложениями (внутренний метод)."""
+        image_ids = [self._resolve_file(x) for x in self._as_list(images)]
+        doc_ids = [self._resolve_file(x) for x in self._as_list(files)]
+        if len(image_ids) > self.MAX_IMAGES:
+            raise ValueError(f"❌ Слишком много изображений: {len(image_ids)} (максимум {self.MAX_IMAGES})")
+        for fid in image_ids:
+            self._image_ids.add(fid)
+        self.last_files = image_ids + doc_ids
+
+        messages = []
+        for number, fid in enumerate(image_ids[:-1], 1):   # В одном сообщении — только одно изображение
+            messages.append({"role": "user", "content": f"Изображение {number}:", "attachments": [fid]})
+        final: Dict[str, Any] = {"role": "user", "content": user_text}
+        attachments = (image_ids[-1:] if image_ids else []) + doc_ids
+        if attachments:
+            final["attachments"] = attachments
+        messages.append(final)
+        return messages
+
+    def _limit_images(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Убирает самые старые изображения, если их больше лимита (внутренний метод)."""
+        total = sum(1 for m in messages for a in m.get("attachments", []) if a in self._image_ids)
+        excess = total - self.MAX_IMAGES
+        if excess <= 0:
+            return messages
+        result = []
+        for message in messages:
+            attachments = message.get("attachments")
+            if excess > 0 and attachments:
+                kept = []
+                for a in attachments:
+                    if a in self._image_ids and excess > 0:
+                        excess -= 1
+                    else:
+                        kept.append(a)
+                message = {k: v for k, v in message.items() if k != "attachments"}
+                if kept:
+                    message["attachments"] = kept
+            result.append(message)
+        return result
+
+    def _build_payload(self, user_text: str, system_text: str, temperature: float, max_tokens: int,
+                       model: Optional[str], top_p: Optional[float], repetition_penalty: Optional[float],
+                       images: Any, files: Any, use_history: bool, response_format: Optional[Dict],
+                       function_call: Any, extra: Optional[Dict]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        """Собирает тело запроса chat/completions (внутренний метод)."""
+        turn = self._user_messages(user_text, images, files)
+        messages: List[Dict[str, Any]] = []
+        system = system_text or self.system_prompt
+        if system:
+            messages.append({"role": "system", "content": system})
+        if use_history:
+            messages.extend(self.history)
+        messages.extend(turn)
+
+        payload: Dict[str, Any] = {
+            "model": model or self.model,
+            "messages": self._limit_images(messages),
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if top_p is not None:
+            payload["top_p"] = top_p
+        if repetition_penalty is not None:
+            payload["repetition_penalty"] = repetition_penalty
+        if response_format:
+            payload["response_format"] = response_format
+        if function_call is None and len([a for m in turn for a in m.get("attachments", [])
+                                          if a not in self._image_ids]) > 1:
+            function_call = "auto"            # Несколько документов учитываются только с function_call=auto
+        if function_call:
+            payload["function_call"] = function_call
+        if extra:
+            payload.update(extra)
+        return payload, turn
+
+    def _remember(self, turn: List[Dict[str, Any]], answer: str) -> None:
+        """Добавляет обмен репликами в память диалога (внутренний метод)."""
+        self.history.extend(turn)
+        self.history.append({"role": "assistant", "content": answer})
+        if self.max_history and len(self.history) > self.max_history:
+            self.history = self.history[-self.max_history:]
+        while self.history and self.history[0]["role"] != "user":
+            self.history.pop(0)
+
+    def _complete(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Отправляет chat/completions и возвращает полный ответ (внутренний метод)."""
+        resp = self._request("POST", "/chat/completions", json_body=payload)
+        data = resp.json()
+        if not data.get("choices"):
+            raise GigaChatError(f"GigaChat вернул ответ без choices: {data}", resp.status_code, resp.text)
+        self.last_response = data
+        self.last_usage = data.get("usage")
+        return data
+
+    # ---------- Чат ----------
+
+    def chat(self, user_text: str, system_text: str = "", temperature: float = 0.7, max_tokens: int = 500,
+             *, model: Optional[str] = None, top_p: Optional[float] = None,
+             repetition_penalty: Optional[float] = None, images: Any = None, files: Any = None,
+             history: Optional[bool] = None, response_format: Optional[Dict] = None,
+             function_call: Any = None, extra: Optional[Dict] = None) -> str:
         """
         💬 ОТПРАВКА СООБЩЕНИЯ НЕЙРОСЕТИ И ПОЛУЧЕНИЕ ОТВЕТА
 
         Параметры:
             user_text (str): Текст пользователя
-            system_text (str): Системный промпт (инструкция для модели)
+            system_text (str): Системный промпт (инструкция для модели). Если пусто — берётся self.system_prompt
             temperature (float): Креативность (0.0 — точный, 1.0 — творческий)
             max_tokens (int): Максимальная длина ответа в токенах
+            model (str, optional): Модель для этого запроса (по умолчанию self.model)
+            top_p (float, optional): Ядерная выборка от 0 до 1 (альтернатива temperature)
+            repetition_penalty (float, optional): Штраф за повторы (1.0 — нейтрально, больше — меньше повторов)
+            images (str или list, optional): Изображение: путь к файлу, ссылка http(s) или ID уже загруженного файла.
+                                             Можно списком (до 10).
+            files (str или list, optional): Документы (txt, pdf, docx, xlsx...), аналогично images
+            history (bool, optional): Использовать память диалога (None — как задано в remember)
+            response_format (dict, optional): Структурированный ответ, например
+                                              {"type": "json_schema", "schema": {...}, "strict": False}
+            function_call (str или dict, optional): 'auto', 'none' или {"name": "..."} (работа с функциями)
+            extra (dict, optional): Любые дополнительные поля тела запроса (functions и т.п.)
 
         Возвращает:
             str: Ответ нейросети
+
+        Исключения:
+            GigaChatError: Если сервер вернул ошибку.
+            FileNotFoundError: Если файл для images/files не найден.
 
         Пример:
             >>> ai = GigaChat()
             >>> reply = ai.chat("Напиши стих про Python", temperature=0.8)
             >>> print(reply)
+            >>> ai.chat("Что на фото?", images="photo.jpg")
+            >>> print(ai.last_usage)   # {'prompt_tokens': ..., 'completion_tokens': ..., ...}
+
+        Примечание:
+            Одно сообщение может содержать только одно изображение, поэтому несколько картинок
+            уходят отдельными сообщениями (для нескольких изображений это не проверено на реальном API).
+            Несколько документов за раз учитываются только при function_call='auto' — он ставится сам.
         """
-        import requests
-        if not self.verify_ssl:
-            import urllib3
-            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        use_history = self.remember if history is None else history
+        
+        # --- ИСПРАВЛЕНИЕ: Если переданы картинки, а модель не указана явно, используем GigaChat-2-Max ---
+        if images and model is None:
+            model = "GigaChat-2-Max"
+        # -----------------------------------------------------------------------------------------
 
-        if not self._token:
-            self._get_token()
+        payload, turn = self._build_payload(user_text, system_text, temperature, max_tokens, model, top_p,
+                                            repetition_penalty, images, files, use_history,
+                                            response_format, function_call, extra)
+        data = self._complete(payload)
+        answer = data["choices"][0]["message"].get("content", "")
+        if use_history:
+            self._remember(turn, answer)
+        return answer
 
-        messages = []
-        if system_text:
-            messages.append({"role": "system", "content": system_text})
-        messages.append({"role": "user", "content": user_text})
+    def chat_stream(self, user_text: str, system_text: str = "", temperature: float = 0.7,
+                    max_tokens: int = 500, *, model: Optional[str] = None, top_p: Optional[float] = None,
+                    repetition_penalty: Optional[float] = None, update_interval: float = 0,
+                    images: Any = None, files: Any = None, history: Optional[bool] = None,
+                    extra: Optional[Dict] = None) -> Any:
+        """
+        ⚡ ПОТОКОВЫЙ ОТВЕТ — ТЕКСТ ПРИХОДИТ КУСОЧКАМИ ПО МЕРЕ ГЕНЕРАЦИИ
 
-        url = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self._token}"
-        }
-        payload = {
-            "model": "GigaChat",
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens
-        }
+        Параметры:
+            user_text, system_text, temperature, max_tokens, model, top_p, repetition_penalty,
+            images, files, history, extra: Как в chat()
+            update_interval (float): Минимальный интервал (сек) между отправками токенов (0 — сразу)
 
-        resp = requests.post(url, headers=headers, json=payload,
-                             verify=self.verify_ssl, timeout=30)
-        if resp.status_code == 200:
-            return resp.json()["choices"][0]["message"]["content"]
-        else:
-            raise Exception(f"GigaChat API error {resp.status_code}: {resp.text}")
+        Возвращает:
+            generator[str]: Генератор кусочков текста
+
+        Пример:
+            >>> for piece in ai.chat_stream("Расскажи про роботов"):
+            ...     print(piece, end="", flush=True)
+
+        Примечание:
+            В память диалога ответ попадает после того, как генератор полностью прочитан.
+            Статистика токенов сохраняется в ai.last_usage.
+        """
+        use_history = self.remember if history is None else history
+        
+        # --- ИСПРАВЛЕНИЕ: Если переданы картинки, а модель не указана явно, используем GigaChat-2-Max ---
+        if images and model is None:
+            model = "GigaChat-2-Max"
+        # -----------------------------------------------------------------------------------------
+
+        payload, turn = self._build_payload(user_text, system_text, temperature, max_tokens, model, top_p,
+                                            repetition_penalty, images, files, use_history,
+                                            None, None, extra)
+        payload["stream"] = True
+        payload["update_interval"] = update_interval
+
+        resp = self._request("POST", "/chat/completions", json_body=payload, stream=True)
+        resp.encoding = "utf-8"
+        parts: List[str] = []
+        try:
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data:"):
+                    continue
+                chunk = line[5:].strip()
+                if chunk == "[DONE]":
+                    break
+                obj = json.loads(chunk)
+                if obj.get("usage"):
+                    self.last_usage = obj["usage"]
+                choices = obj.get("choices") or [{}]
+                piece = (choices[0].get("delta") or {}).get("content") or ""
+                if piece:
+                    parts.append(piece)
+                    yield piece
+        finally:
+            resp.close()
+        if use_history:
+            self._remember(turn, "".join(parts))
+
+    def reset_history(self) -> None:
+        """
+        🧹 ОЧИСТИТЬ ПАМЯТЬ ДИАЛОГА
+
+        Пример:
+            >>> ai = GigaChat(remember=True)
+            >>> ai.chat("Меня зовут Юсуф")
+            >>> ai.reset_history()
+        """
+        self.history = []
 
     def clean_speech(self, raw_text: str) -> str:
         """
@@ -720,6 +1085,7 @@ class GigaChat:
 
         Примечание:
             Внутри отправляет запрос к GigaChat с низкой температурой (0.2).
+            Память диалога не используется и не засоряется.
         """
         system_prompt = """
             Ты — аудио-корректор. Получив текст, который может содержать:
@@ -734,8 +1100,2567 @@ class GigaChat:
             user_text=raw_text,
             system_text=system_prompt,
             temperature=0.2,
-            max_tokens=200
+            max_tokens=200,
+            history=False
         )
+
+    # ---------- Изображения ----------
+
+    def ask_image(self, question: str, image: Any, *, system_text: str = "", temperature: float = 0.2,
+                  max_tokens: int = 500, model: Optional[str] = None, top_p: Optional[float] = None,
+                  history: Optional[bool] = None, delete_after: bool = False,
+                  extra: Optional[Dict] = None) -> str:
+        """
+        🖼️ ВОПРОС ПО ИЗОБРАЖЕНИЮ
+
+        Параметры:
+            question (str): Вопрос к картинке («Что здесь изображено?», «Сколько людей на фото?»)
+            image (str или list): Путь к файлу, ссылка http(s) или ID загруженного файла (или список до 10)
+            system_text (str): Системный промпт
+            temperature (float): Креативность (для описаний лучше низкая)
+            max_tokens (int): Максимальная длина ответа
+            model (str, optional): Модель (если не указана, автоматически используется GigaChat-2-Max)
+            top_p (float, optional): Ядерная выборка
+            history (bool, optional): Использовать память диалога (для уточняющих вопросов к той же картинке)
+            delete_after (bool): Удалить загруженные файлы из хранилища после ответа (не используй с памятью диалога)
+            extra (dict, optional): Дополнительные поля запроса
+
+        Возвращает:
+            str: Ответ нейросети
+
+        Пример:
+            >>> ai = GigaChat(remember=True)
+            >>> print(ai.ask_image("Что на фото?", "cat.jpg"))
+            >>> print(ai.ask_image("А какого он цвета?", "cat.jpg"))   # та же картинка не загружается повторно
+
+        Примечание:
+            Лимиты: изображение до 15 МБ, не больше 10 изображений в запросе. Повторно та же картинка
+            не загружается (ID берётся из кэша).
+        """
+        answer = self.chat(question, system_text=system_text, temperature=temperature,
+                           max_tokens=max_tokens, model=model, top_p=top_p, images=image,
+                           history=history, extra=extra)
+        if delete_after:
+            for file_id in list(self.last_files):
+                self.delete_file(file_id)
+        return answer
+
+    def describe_image(self, image: Any, style: str = "detailed", prompt: Optional[str] = None,
+                       **kwargs) -> str:
+        """
+        👁️ ОПИСАНИЕ ИЗОБРАЖЕНИЯ
+
+        Параметры:
+            image (str или list): Путь к файлу, ссылка http(s) или ID загруженного файла
+            style (str): 'brief' (1-2 предложения), 'detailed' (подробно), 'alt' (alt-текст),
+                         'text' (переписать надписи с картинки), 'objects' (список объектов)
+            prompt (str, optional): Свой запрос вместо готового стиля
+            **kwargs: Параметры ask_image() (model, temperature, max_tokens, delete_after...)
+
+        Возвращает:
+            str: Описание изображения
+
+        Исключения:
+            ValueError: Если указан неизвестный style.
+
+        Пример:
+            >>> print(ai.describe_image("photo.jpg"))
+            >>> print(ai.describe_image("sign.png", style="text"))
+            >>> print(ai.describe_image("room.jpg", prompt="Опиши мебель в комнате"))
+        """
+        if prompt is None:
+            if style not in self.IMAGE_PROMPTS:
+                raise ValueError(f"❌ Неизвестный style '{style}'. Доступны: {', '.join(self.IMAGE_PROMPTS)}")
+            prompt = self.IMAGE_PROMPTS[style]
+        return self.ask_image(prompt, image, **kwargs)
+
+    def generate_image(self, prompt: str, save_path: str = "gigachat_image.jpg", *,
+                       model: Optional[str] = None) -> str:
+        """
+        🎨 ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЯ ПО ТЕКСТУ
+
+        Параметры:
+            prompt (str): Что нарисовать («розовый кот в космосе»)
+            save_path (str): Куда сохранить картинку
+            model (str, optional): Модель (по умолчанию GigaChat-2-Max)
+
+        Возвращает:
+            str: Путь к сохранённому изображению
+
+        Исключения:
+            GigaChatError: Если модель не вернула изображение.
+
+        Пример:
+            >>> path = ai.generate_image("уютный робот читает книгу")
+            >>> print(path)
+
+        Примечание:
+            Работает через встроенную функцию генерации (function_call='auto'). ID картинки берётся
+            из тега <img src="..."/> в ответе. Эта функция сделана по документации Сбера и не проверялась
+            на реальном API.
+        """
+        import re
+        text = prompt if "нарису" in prompt.lower() else f"Нарисуй: {prompt}"
+        
+        # --- ИСПРАВЛЕНИЕ: Для генерации картинок нужна модель GigaChat-2-Max ---
+        payload = {"model": model or "GigaChat-2-Max", "function_call": "auto",
+                   "messages": [{"role": "user", "content": text}]}
+        # ----------------------------------------------------------------------
+
+        content = self._complete(payload)["choices"][0]["message"].get("content", "") or ""
+        found = re.search(r'<img[^>]*\bsrc="([^"]+)"', content)
+        if not found:
+            raise GigaChatError(f"Модель не вернула изображение. Ответ: {content[:200]}")
+        return self.download_file(found.group(1), save_path)
+
+    # ---------- Файлы ----------
+
+    def upload_file(self, path: str, purpose: str = "general", reuse: bool = True) -> str:
+        """
+        📤 ЗАГРУЗКА ФАЙЛА В ХРАНИЛИЩЕ GigaChat
+
+        Параметры:
+            path (str): Путь к файлу (изображение до 15 МБ, документ до 40 МБ)
+            purpose (str): Назначение (сейчас только 'general')
+            reuse (bool): Не загружать повторно тот же неизменённый файл
+
+        Возвращает:
+            str: ID файла (его можно передавать в images=/files=)
+
+        Исключения:
+            FileNotFoundError: Если файла нет.
+            ValueError: Если файл больше лимита.
+
+        Пример:
+            >>> file_id = ai.upload_file("report.pdf")
+            >>> ai.chat("Сделай краткое резюме", files=file_id)
+        """
+        import mimetypes
+        file_path = Path(path)
+        if not file_path.is_file():
+            raise FileNotFoundError(f"❌ Файл не найден: {path}")
+        is_image = file_path.suffix.lower() in self.IMAGE_EXTENSIONS
+        size = file_path.stat().st_size
+        limit = self.MAX_IMAGE_BYTES if is_image else self.MAX_FILE_BYTES
+        if size > limit:
+            raise ValueError(f"❌ Файл слишком большой: {size / 1048576:.1f} МБ (лимит {limit // 1048576} МБ)")
+
+        cache_key = (str(file_path.resolve()), size, int(file_path.stat().st_mtime))
+        if reuse and cache_key in self._file_cache:
+            return self._file_cache[cache_key]
+
+        mime = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+        content = file_path.read_bytes()
+        resp = self._request("POST", "/files", files={"file": (file_path.name, content, mime)},
+                             data={"purpose": purpose}, timeout=max(self.timeout, 60))
+        file_id = resp.json()["id"]
+        self._file_cache[cache_key] = file_id
+        if is_image:
+            self._image_ids.add(file_id)
+        return file_id
+
+    def list_files(self) -> List[Dict[str, Any]]:
+        """
+        📂 СПИСОК ЗАГРУЖЕННЫХ ФАЙЛОВ
+
+        Возвращает:
+            List[dict]: Файлы с полями id, filename, bytes, created_at, purpose...
+
+        Пример:
+            >>> for f in ai.list_files():
+            ...     print(f["id"], f["filename"])
+        """
+        return self._request("GET", "/files").json().get("data", [])
+
+    def get_file_info(self, file_id: str) -> Dict[str, Any]:
+        """
+        ℹ️ ИНФОРМАЦИЯ О ФАЙЛЕ
+
+        Параметры:
+            file_id (str): ID файла
+
+        Возвращает:
+            dict: id, filename, bytes, created_at, purpose, access_policy
+
+        Пример:
+            >>> print(ai.get_file_info(file_id)["filename"])
+        """
+        return self._request("GET", f"/files/{file_id}").json()
+
+    def download_file(self, file_id: str, save_path: str) -> str:
+        """
+        📥 СКАЧИВАНИЕ ФАЙЛА ИЗ ХРАНИЛИЩА (например, сгенерированной картинки)
+
+        Параметры:
+            file_id (str): ID файла
+            save_path (str): Куда сохранить
+
+        Возвращает:
+            str: Путь к сохранённому файлу
+
+        Пример:
+            >>> ai.download_file(file_id, "result.jpg")
+        """
+        content = self._request("GET", f"/files/{file_id}/content").content
+        folder = os.path.dirname(os.path.abspath(save_path))
+        os.makedirs(folder, exist_ok=True)
+        with open(save_path, "wb") as handle:
+            handle.write(content)
+        return save_path
+
+    def delete_file(self, file_id: str) -> bool:
+        """
+        🗑️ УДАЛЕНИЕ ФАЙЛА ИЗ ХРАНИЛИЩА
+
+        Параметры:
+            file_id (str): ID файла
+
+        Возвращает:
+            bool: True, если файл удалён
+
+        Пример:
+            >>> ai.delete_file(file_id)
+        """
+        result = self._request("POST", f"/files/{file_id}/delete").json()
+        self._image_ids.discard(file_id)
+        self._file_cache = {k: v for k, v in self._file_cache.items() if v != file_id}
+        return bool(result.get("deleted", False))
+
+    # ---------- Служебные функции ----------
+
+    def count_tokens(self, text: Union[str, List[str]], model: Optional[str] = None) -> Union[int, List[int]]:
+        """
+        🔢 ПОДСЧЁТ ТОКЕНОВ В ТЕКСТЕ
+
+        Параметры:
+            text (str или list): Текст или список текстов
+            model (str, optional): Модель (у разных моделей токенизация может отличаться)
+
+        Возвращает:
+            int или List[int]: Число токенов (число для строки, список для списка)
+
+        Пример:
+            >>> print(ai.count_tokens("Привет, как дела?"))
+            >>> print(ai.count_tokens(["раз", "два три"]))
+        """
+        texts = [text] if isinstance(text, str) else list(text)
+        data = self._request("POST", "/tokens/count",
+                             json_body={"model": model or self.model, "input": texts}).json()
+        items = data if isinstance(data, list) else data.get("data", [])
+        counts = [int(item["tokens"]) for item in items]
+        return counts[0] if isinstance(text, str) else counts
+
+    def get_balance(self) -> Dict[str, int]:
+        """
+        💰 ОСТАТОК ТОКЕНОВ
+
+        Возвращает:
+            dict: {"GigaChat": 1000000, ...} — остаток токенов по моделям
+
+        Исключения:
+            GigaChatError: Если метод недоступен (при оплате pay-as-you-go сервер отвечает 403).
+
+        Пример:
+            >>> print(ai.get_balance())
+        """
+        data = self._request("GET", "/balance").json()
+        return {item["usage"]: item["value"] for item in data.get("balance", [])}
+
+    def list_models(self, kind: Optional[str] = "chat") -> List[str]:
+        """
+        📜 СПИСОК ДОСТУПНЫХ МОДЕЛЕЙ
+
+        Параметры:
+            kind (str, optional): Тип: 'chat' (чат), 'embedder' (эмбеддинги), 'aicheck'. None — все
+
+        Возвращает:
+            List[str]: Названия моделей (значения для параметра model)
+
+        Пример:
+            >>> print(ai.list_models())
+            >>> ai.model = ai.list_models()[0]
+        """
+        data = self._request("GET", "/models").json().get("data", [])
+        return [m["id"] for m in data if kind is None or m.get("type") == kind]
+
+    def embeddings(self, texts: Union[str, List[str]], model: str = "Embeddings") -> List[List[float]]:
+        """
+        🧬 ЭМБЕДДИНГИ (ВЕКТОРНОЕ ПРЕДСТАВЛЕНИЕ ТЕКСТА)
+
+        Параметры:
+            texts (str или list): Текст или список текстов
+            model (str): 'Embeddings', 'Embeddings-2' или 'EmbeddingsGigaR'
+
+        Возвращает:
+            List[List[float]]: Вектор для каждого текста (в том же порядке)
+
+        Пример:
+            >>> vectors = ai.embeddings(["кошка", "собака"])
+            >>> print(len(vectors), len(vectors[0]))
+        """
+        items = [texts] if isinstance(texts, str) else list(texts)
+        data = self._request("POST", "/embeddings", json_body={"model": model, "input": items}).json()
+        rows = sorted(data.get("data", []), key=lambda row: row.get("index", 0))
+        return [row["embedding"] for row in rows]
+
+
+# =================================================================================================
+# КЛАСС Voice – ГОЛОС: РАСПОЗНАВАНИЕ И СИНТЕЗ РЕЧИ (GOOGLE, VOSK, GIGAAM, WHISPER, SILERO, EDGE...)
+# =================================================================================================
+
+class Voice:
+    """
+    🎙️ ГОЛОС — РАСПОЗНАВАНИЕ (STT) И СИНТЕЗ (TTS) РЕЧИ В ОДНОМ КЛАССЕ
+
+    Все методы статические. Движок можно выбрать параметром engine (общие функции
+    say() и listen()) или вызвать его отдельную функцию: say_silero(), listen_vosk() и т.д.
+
+    📌 РАСПОЗНАВАНИЕ РЕЧИ (STT):
+        - google  — онлайн, Google Speech Recognition (как в Manager.listen_text)
+        - vosk    — офлайн, лёгкий, потоковый, умеет ограничивать словарь (идеально для команд)
+        - gigaam  — офлайн, Сбер GigaAM, один из лучших для русского (нужен torch)
+        - whisper — офлайн, faster-whisper, много языков
+
+    📌 СИНТЕЗ РЕЧИ (TTS):
+        - gtts    — онлайн, Google TTS (как в Manager.say)
+        - silero  — офлайн, нейросеть, лучший офлайн-голос для русского (нужен torch)
+        - edge    — онлайн, нейроголоса Microsoft Edge (свои темп, тембр и громкость)
+        - pyttsx3 — офлайн, голоса операционной системы (SAPI5 на Windows)
+
+    📌 ТЕМП, ТЕМБР И ГРОМКОСТЬ ДЛЯ ЛЮБОГО ДВИЖКА:
+        У каждой say_*() есть параметры speed (темп), pitch_shift (тембр в полутонах)
+        и gain (громкость). Они применяются поверх готового звука, поэтому работают
+        даже там, где у самого движка такой настройки нет (gTTS, pyttsx3, Silero).
+
+    📌 ТРЕБОВАНИЯ (ставятся только под тот движок, который используешь):
+        - Общее: numpy, soundfile, sounddevice (запись и воспроизведение), ffmpeg (темп и тембр)
+        - google: SpeechRecognition + PyAudio | vosk: vosk | whisper: faster-whisper
+        - gigaam: torch + gigaam (pip install https://github.com/salute-developers/GigaAM/archive/refs/heads/main.zip --no-deps)
+        - gtts: gTTS | silero: torch | edge: edge-tts | pyttsx3: pyttsx3
+
+    📌 ПРИМЕРЫ:
+        >>> Voice.say("Привет, я Кеша!")                                    # gTTS, как Manager.say
+        >>> Voice.say("Привет!", engine="silero", voice="aidar", pitch_shift=-2)
+        >>> Voice.say_edge("Привет!", voice="ru-RU-DmitryNeural", rate=15)
+        >>> text = Voice.listen(engine="gigaam", seconds=8)
+        >>> cmd = Voice.listen_vosk(grammar=["включи свет", "выключи свет"])
+        >>> text = Voice.transcribe_file("my_voice.wav", engine="whisper")
+        >>> Voice.check()                                                   # что установлено
+    """
+
+    # -------------------------------------------------------------------------
+    # ⚙️ НАСТРОЙКИ И СПРАВОЧНИКИ
+    # -------------------------------------------------------------------------
+
+    STT_ENGINES = ("google", "vosk", "gigaam", "whisper")
+    TTS_ENGINES = ("gtts", "silero", "edge", "pyttsx3")
+
+    DEFAULT_STT = "google"    # Движок распознавания по умолчанию (как в Manager.listen_text)
+    DEFAULT_TTS = "gtts"      # Движок синтеза по умолчанию (как в Manager.say)
+
+    CACHE_DIR = Path.home() / ".cache" / "help_manager" / "voice"   # Сюда скачиваются модели Silero
+
+    SILERO_URL = "https://models.silero.ai/models/tts/ru/{model}.pt"
+    SILERO_SPEAKERS = {
+        "v5_6_ru": ["aidar", "baya", "kseniya", "xenia", "eugene"],
+        "v5_5_ru": ["aidar", "baya", "kseniya", "xenia", "eugene"],
+        "v5_4_ru": ["aidar", "baya", "kseniya", "xenia"],
+        "v5_3_ru": ["aidar", "baya", "kseniya", "xenia", "eugene"],
+        "v5_2_ru": ["aidar", "baya", "kseniya", "xenia", "eugene"],
+        "v5_ru": ["aidar", "baya", "kseniya", "xenia", "eugene"],
+        "v4_ru": ["aidar", "baya", "kseniya", "xenia", "eugene", "random"],
+    }
+    SILERO_RATES = ("x-slow", "slow", "medium", "fast", "x-fast")     # Допустимые rate в SSML <prosody>
+    SILERO_PITCHES = ("x-low", "low", "medium", "high", "x-high")     # Допустимые pitch в SSML <prosody>
+
+    GIGAAM_MODELS = (
+        "v3_ctc", "v3_rnnt", "v3_e2e_ctc", "v3_e2e_rnnt",
+        "v2_ctc", "v2_rnnt", "v1_ctc", "v1_rnnt",
+        "multilingual_ctc", "multilingual_large_ctc",
+    )   # v3_e2e_* сами ставят пунктуацию и нормализуют текст
+    EDGE_RU_VOICES = ("ru-RU-SvetlanaNeural", "ru-RU-DmitryNeural")
+
+    _cache: Dict[Any, Any] = {}   # Кэш загруженных моделей (чтобы не грузить их на каждый вызов)
+
+    # -------------------------------------------------------------------------
+    # 🔧 ВНУТРЕННИЕ МЕТОДЫ
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _import(module: str, pip_name: Optional[str] = None):
+        """Импортирует библиотеку или подсказывает, что поставить (внутренний метод)."""
+        import importlib
+        try:
+            return importlib.import_module(module)
+        except ImportError as e:
+            raise ImportError(
+                f"❌ Не установлена библиотека '{module}'. Установи: pip install {pip_name or module}"
+            ) from e
+
+    @staticmethod
+    def _ffmpeg() -> Optional[str]:
+        """Путь к ffmpeg или None (внутренний метод)."""
+        return shutil.which("ffmpeg")
+
+    @staticmethod
+    def _tmp(suffix: str = ".wav") -> str:
+        """Создаёт пустой временный файл и возвращает путь (внутренний метод)."""
+        fd, path = tempfile.mkstemp(suffix=suffix, prefix="voice_")
+        os.close(fd)
+        return path
+
+    @staticmethod
+    def _remove(path: Optional[str]) -> None:
+        """Безопасно удаляет файл (внутренний метод)."""
+        if path and os.path.exists(path):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _check_output(play: bool, save_path: Optional[str]) -> None:
+        """Проверяет, что у синтеза есть хоть какой-то результат (внутренний метод)."""
+        if not play and not save_path:
+            raise ValueError("❌ Нечего делать: play=False и не указан save_path")
+
+    @staticmethod
+    def _read_audio(path: str):
+        """Читает аудиофайл (wav, mp3, flac, ogg...) → (numpy float32, частота) (внутренний метод)."""
+        np = Voice._import("numpy")
+        try:
+            sf = Voice._import("soundfile")
+            data, sample_rate = sf.read(path, dtype="float32", always_2d=False)
+            return data, int(sample_rate)
+        except Exception:
+            # Запасной путь: pydub + ffmpeg (экзотические форматы)
+            from pydub import AudioSegment
+            seg = AudioSegment.from_file(path)
+            arr = np.array(seg.get_array_of_samples(), dtype=np.float32)
+            arr /= float(1 << (8 * seg.sample_width - 1))
+            if seg.channels > 1:
+                arr = arr.reshape(-1, seg.channels)
+            return arr, int(seg.frame_rate)
+
+    @staticmethod
+    def _write_audio(path: str, data, sample_rate: int) -> None:
+        """Пишет numpy-массив в файл (формат по расширению) (внутренний метод)."""
+        np = Voice._import("numpy")
+        sf = Voice._import("soundfile")
+        data = np.clip(np.asarray(data, dtype=np.float32), -1.0, 1.0)
+        if path.lower().endswith(".wav"):
+            sf.write(path, data, int(sample_rate), subtype="PCM_16")
+        else:
+            sf.write(path, data, int(sample_rate))
+
+    @staticmethod
+    def _resample(data, rate_from: int, rate_to: int):
+        """Простая передискретизация (линейная, с усреднением при понижении) (внутренний метод)."""
+        np = Voice._import("numpy")
+        if rate_from == rate_to or len(data) == 0:
+            return data
+        ratio = rate_from / float(rate_to)
+        width = int(round(ratio))
+        if width > 1:
+            kernel = np.ones(width, dtype=np.float32) / width
+
+            def smooth(ch):
+                return np.convolve(ch, kernel, mode="same")
+        else:
+            def smooth(ch):
+                return ch
+        n_out = max(1, int(round(len(data) / ratio)))
+        positions = np.arange(n_out) * ratio
+        grid = np.arange(len(data))
+        if data.ndim == 1:
+            return np.interp(positions, grid, smooth(data)).astype(np.float32)
+        cols = [np.interp(positions, grid, smooth(data[:, c])) for c in range(data.shape[1])]
+        return np.stack(cols, axis=1).astype(np.float32)
+
+    @staticmethod
+    def _time_stretch(data, sample_rate: int, tempo: float):
+        """Меняет темп без смены высоты тона через ffmpeg atempo (внутренний метод)."""
+        ffmpeg = Voice._ffmpeg()
+        if not ffmpeg:
+            print("⚠️ ffmpeg не найден: темп меняется вместе с высотой тона")
+            return Voice._resample(data, sample_rate, int(round(sample_rate / tempo)))
+
+        factors = []
+        rest = tempo
+        while rest > 2.0:
+            factors.append(2.0)
+            rest /= 2.0
+        while rest < 0.5:
+            factors.append(0.5)
+            rest /= 0.5
+        factors.append(rest)
+        chain = ",".join(f"atempo={f:.5f}" for f in factors)
+
+        src, dst = Voice._tmp(".wav"), Voice._tmp(".wav")
+        try:
+            Voice._write_audio(src, data, sample_rate)
+            result = subprocess.run(
+                [ffmpeg, "-y", "-loglevel", "error", "-i", src, "-filter:a", chain, dst],
+                capture_output=True,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.decode("utf-8", "replace").strip() or "ffmpeg завершился с ошибкой")
+            stretched, _ = Voice._read_audio(dst)
+            return stretched
+        finally:
+            Voice._remove(src)
+            Voice._remove(dst)
+
+    @staticmethod
+    def _apply_effects(path: str, speed: float = 1.0, pitch_shift: float = 0.0, gain: float = 1.0) -> str:
+        """
+        Применяет темп, тембр и громкость к аудиофайлу (внутренний метод).
+
+        Возвращает путь к новому временному WAV или исходный путь, если эффекты не нужны.
+        """
+        if speed == 1.0 and pitch_shift == 0.0 and gain == 1.0:
+            return path
+        if speed <= 0:
+            raise ValueError("❌ speed должен быть больше 0 (1.0 — обычный темп)")
+        if gain < 0:
+            raise ValueError("❌ gain не может быть отрицательным (1.0 — обычная громкость)")
+
+        np = Voice._import("numpy")
+        data, sample_rate = Voice._read_audio(path)
+
+        factor = 2.0 ** (pitch_shift / 12.0)          # Во сколько раз меняется частота голоса
+        if factor != 1.0:
+            data = Voice._resample(data, sample_rate, int(round(sample_rate / factor)))
+        tempo = speed / factor                         # Компенсируем длительность, изменённую тембром
+        if abs(tempo - 1.0) > 1e-3:
+            data = Voice._time_stretch(data, sample_rate, tempo)
+        data = np.asarray(data, dtype=np.float32) * float(gain)
+
+        out = Voice._tmp(".wav")
+        Voice._write_audio(out, data, sample_rate)
+        return out
+
+    @staticmethod
+    def _save_as(src: str, dst: str) -> None:
+        """Сохраняет аудио в нужном формате по расширению dst (внутренний метод)."""
+        os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
+        if os.path.splitext(src)[1].lower() == os.path.splitext(dst)[1].lower():
+            shutil.copyfile(src, dst)
+            return
+        data, sample_rate = Voice._read_audio(src)
+        try:
+            Voice._write_audio(dst, data, sample_rate)
+        except Exception:
+            from pydub import AudioSegment
+            fmt = os.path.splitext(dst)[1].lstrip(".").lower() or "wav"
+            AudioSegment.from_file(src).export(dst, format=fmt)
+
+    @staticmethod
+    def _finalize(src: str, *, save_path: Optional[str], play: bool, speed: float,
+                  pitch_shift: float, gain: float, block: bool) -> Optional[str]:
+        """Эффекты → сохранение → воспроизведение → уборка временных файлов (внутренний метод)."""
+        produced = [src]
+        try:
+            path = Voice._apply_effects(src, speed, pitch_shift, gain)
+            if path != src:
+                produced.append(path)
+            if save_path:
+                Voice._save_as(path, save_path)
+            if play:
+                Voice.play(path, block=block)
+            return save_path
+        finally:
+            for item in produced:
+                Voice._remove(item)
+
+    @staticmethod
+    def _edge_value(value: Union[str, int, float], unit: str, name: str) -> str:
+        """Превращает число в строку формата edge-tts: 15 → '+15%' (внутренний метод)."""
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, (int, float)):
+            return f"{int(round(value)):+d}{unit}"
+        raise TypeError(f"❌ {name}: ожидается число или строка вида '+10{unit}'")
+
+    @staticmethod
+    def _split_text(text: str, max_chars: int) -> List[str]:
+        """Режет длинный текст на куски по предложениям (внутренний метод)."""
+        import re
+        text = text.strip()
+        if len(text) <= max_chars:
+            return [text]
+        chunks, current = [], ""
+        for sentence in re.split(r"(?<=[.!?…])\s+", text):
+            while len(sentence) > max_chars:
+                cut = sentence.rfind(" ", 0, max_chars)
+                if cut <= 0:
+                    cut = max_chars
+                head, sentence = sentence[:cut], sentence[cut:].lstrip()
+                if current:
+                    chunks.append(current)
+                    current = ""
+                chunks.append(head)
+            if not sentence:
+                continue
+            if current and len(current) + 1 + len(sentence) > max_chars:
+                chunks.append(current)
+                current = sentence
+            else:
+                current = f"{current} {sentence}".strip()
+        if current:
+            chunks.append(current)
+        return chunks
+
+    @staticmethod
+    def _split_audio(mono, sample_rate: int, max_seconds: float) -> List[Tuple[int, int]]:
+        """Режет длинную запись на куски по самым тихим местам (внутренний метод)."""
+        np = Voice._import("numpy")
+        total = len(mono)
+        max_len = int(max_seconds * sample_rate)
+        if total <= max_len:
+            return [(0, total)]
+        frame = max(1, int(0.02 * sample_rate))
+        window = int(2.0 * sample_rate)
+        ranges, start = [], 0
+        while total - start > max_len:
+            hi = start + max_len
+            lo = max(hi - window, start + frame)
+            part = mono[lo:hi]
+            frames = len(part) // frame
+            if frames > 0:
+                energy = (part[:frames * frame].reshape(frames, frame) ** 2).mean(axis=1)
+                cut = lo + int(np.argmin(energy)) * frame + frame // 2
+            else:
+                cut = hi
+            ranges.append((start, cut))
+            start = cut
+        ranges.append((start, total))
+        return ranges
+
+    @staticmethod
+    def _to_mono_16k(path: str) -> str:
+        """Конвертирует любой аудиофайл в временный WAV 16 кГц моно (удалять после использования)."""
+        out = Voice._tmp(".wav")
+        ffmpeg = Voice._ffmpeg()
+        if ffmpeg:
+            result = subprocess.run(
+                [ffmpeg, "-y", "-loglevel", "error", "-i", path, "-ac", "1", "-ar", "16000", "-f", "wav", out],
+                capture_output=True,
+            )
+            if result.returncode == 0 and os.path.getsize(out) > 44:
+                return out
+        data, sample_rate = Voice._read_audio(path)
+        mono = data if data.ndim == 1 else data.mean(axis=1)
+        Voice._write_audio(out, Voice._resample(mono, sample_rate, 16000), 16000)
+        return out
+
+    @staticmethod
+    def _google_lang(language: str) -> str:
+        """'ru' → 'ru-RU' для Google Speech Recognition (внутренний метод)."""
+        short = {"ru": "ru-RU", "en": "en-US", "uk": "uk-UA", "de": "de-DE", "fr": "fr-FR",
+                 "es": "es-ES", "it": "it-IT", "kk": "kk-KZ", "tr": "tr-TR", "pl": "pl-PL",
+                 "zh": "zh-CN", "ja": "ja-JP"}
+        return short.get(language.lower(), language)
+
+    # ---------- Загрузка и кэш моделей ----------
+
+    @staticmethod
+    def _get_silero(model: str, device: str, num_threads: Optional[int]):
+        """Загружает модель Silero TTS (скачивает при первом запуске) (внутренний метод)."""
+        key = ("silero", model, str(device))
+        if key in Voice._cache:
+            return Voice._cache[key]
+        torch = Voice._import("torch")
+        package = Voice._import("torch.package", "torch")
+        if num_threads:
+            torch.set_num_threads(int(num_threads))
+
+        if os.path.isfile(model):
+            model_path = model
+        else:
+            Voice.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            model_path = str(Voice.CACHE_DIR / f"silero_{model}.pt")
+            if not os.path.isfile(model_path):
+                print(f"⏳ Скачиваю модель Silero '{model}' (один раз)...")
+                part = model_path + ".part"
+                torch.hub.download_url_to_file(Voice.SILERO_URL.format(model=model), part)
+                os.replace(part, model_path)
+
+        tts = package.PackageImporter(model_path).load_pickle("tts_models", "model")
+        tts.to(torch.device(device))
+        Voice._cache[key] = tts
+        return tts
+
+    @staticmethod
+    def _get_gigaam(model: str, device: Optional[str], fp16_encoder: bool,
+                    use_flash: bool, download_root: Optional[str]):
+        """Загружает модель GigaAM (скачивает при первом запуске) (внутренний метод)."""
+        key = ("gigaam", model, str(device))
+        if key not in Voice._cache:
+            gigaam = Voice._import(
+                "gigaam",
+                "https://github.com/salute-developers/GigaAM/archive/refs/heads/main.zip --no-deps",
+            )
+            print(f"⏳ Загружаю GigaAM '{model}' (первый раз скачивает веса)...")
+            Voice._cache[key] = gigaam.load_model(
+                model, fp16_encoder=fp16_encoder, use_flash=use_flash,
+                device=device, download_root=download_root,
+            )
+        return Voice._cache[key]
+
+    @staticmethod
+    def _get_vosk(model: Optional[str], language: str):
+        """Загружает модель Vosk: папку, имя для скачивания или модель по языку (внутренний метод)."""
+        key = ("vosk", model or language)
+        if key not in Voice._cache:
+            vosk = Voice._import("vosk")
+            vosk.SetLogLevel(-1)
+            if model and os.path.isdir(model):
+                Voice._cache[key] = vosk.Model(model_path=model)
+            elif model:
+                Voice._cache[key] = vosk.Model(model_name=model)
+            else:
+                Voice._cache[key] = vosk.Model(lang=language)
+        return Voice._cache[key]
+
+    @staticmethod
+    def _get_whisper(model: str, device: str, compute_type: str, cpu_threads: int,
+                     download_root: Optional[str]):
+        """Загружает модель faster-whisper (внутренний метод)."""
+        key = ("whisper", model, device, compute_type)
+        if key not in Voice._cache:
+            faster_whisper = Voice._import("faster_whisper", "faster-whisper")
+            print(f"⏳ Загружаю Whisper '{model}' (первый раз скачивает веса)...")
+            Voice._cache[key] = faster_whisper.WhisperModel(
+                model, device=device, compute_type=compute_type,
+                cpu_threads=cpu_threads, download_root=download_root,
+            )
+        return Voice._cache[key]
+
+    @staticmethod
+    def _get_pyttsx3(driver: Optional[str]):
+        """Создаёт (один раз) движок pyttsx3 (внутренний метод)."""
+        key = ("pyttsx3", driver)
+        if key not in Voice._cache:
+            pyttsx3 = Voice._import("pyttsx3")
+            Voice._cache[key] = pyttsx3.init(driver)
+        return Voice._cache[key]
+
+    @staticmethod
+    def _pick_pyttsx3_voice(engine, voice: str) -> str:
+        """Ищет голос pyttsx3 по точному id или куску имени (внутренний метод)."""
+        voices = engine.getProperty("voices")
+        needle = str(voice).lower()
+        for item in voices:
+            if needle == str(item.id).lower():
+                return item.id
+        for item in voices:
+            haystack = f"{item.name} {item.id} {getattr(item, 'languages', '')}".lower()
+            if needle in haystack:
+                return item.id
+        names = ", ".join(str(v.name) for v in voices)
+        raise ValueError(f"❌ Голос pyttsx3 '{voice}' не найден. Доступные: {names}")
+
+    # -------------------------------------------------------------------------
+    # 🧰 СЛУЖЕБНЫЕ: ПРОВЕРКА, НАСТРОЙКА, СПИСКИ ГОЛОСОВ
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def engines() -> Dict[str, Dict[str, bool]]:
+        """
+        🔍 КАКИЕ ДВИЖКИ И ИНСТРУМЕНТЫ УСТАНОВЛЕНЫ
+
+        Возвращает:
+            dict: {"stt": {...}, "tts": {...}, "tools": {...}} со значениями True/False
+
+        Пример:
+            >>> Voice.engines()["stt"]["vosk"]
+            True
+
+        Примечание:
+            Проверяет только наличие библиотек, модели при этом не загружаются.
+        """
+        import importlib.util
+
+        def has(*modules: str) -> bool:
+            try:
+                return all(importlib.util.find_spec(m) is not None for m in modules)
+            except (ImportError, ValueError):
+                return False
+
+        return {
+            "stt": {
+                "google": has("speech_recognition"),
+                "vosk": has("vosk"),
+                "gigaam": has("gigaam", "torch"),
+                "whisper": has("faster_whisper"),
+            },
+            "tts": {
+                "gtts": has("gtts"),
+                "silero": has("torch"),
+                "edge": has("edge_tts"),
+                "pyttsx3": has("pyttsx3"),
+            },
+            "tools": {
+                "numpy": has("numpy"),
+                "soundfile": has("soundfile"),
+                "sounddevice": has("sounddevice"),
+                "pydub": has("pydub"),
+                "ffmpeg": Voice._ffmpeg() is not None,
+            },
+        }
+
+    @staticmethod
+    def check() -> None:
+        """
+        ✅ ВЫВЕСТИ В КОНСОЛЬ, ЧТО УСТАНОВЛЕНО И ЧЕГО НЕ ХВАТАЕТ
+
+        Пример:
+            >>> Voice.check()
+        """
+        titles = {"stt": "🎤 РАСПОЗНАВАНИЕ", "tts": "🔊 СИНТЕЗ", "tools": "🧰 ИНСТРУМЕНТЫ"}
+        hints = {
+            "google": "pip install SpeechRecognition pyaudio", "vosk": "pip install vosk",
+            "gigaam": "pip install torch + GigaAM с GitHub", "whisper": "pip install faster-whisper",
+            "gtts": "pip install gTTS", "silero": "pip install torch", "edge": "pip install edge-tts",
+            "pyttsx3": "pip install pyttsx3", "numpy": "pip install numpy",
+            "soundfile": "pip install soundfile", "sounddevice": "pip install sounddevice",
+            "pydub": "pip install pydub", "ffmpeg": "установи ffmpeg и добавь в PATH",
+        }
+        for group, items in Voice.engines().items():
+            print(f"\n{titles[group]}")
+            for name, ok in items.items():
+                print(f"  ✅ {name}" if ok else f"  ❌ {name} — {hints[name]}")
+
+    @staticmethod
+    def use(tts: Optional[str] = None, stt: Optional[str] = None) -> None:
+        """
+        🎛️ ВЫБРАТЬ ДВИЖКИ ПО УМОЛЧАНИЮ ДЛЯ say() И listen()
+
+        Параметры:
+            tts (str, optional): 'gtts', 'silero', 'edge' или 'pyttsx3'
+            stt (str, optional): 'google', 'vosk', 'gigaam' или 'whisper'
+
+        Исключения:
+            ValueError: Если указан неизвестный движок.
+
+        Пример:
+            >>> Voice.use(tts="silero", stt="gigaam")
+            >>> Voice.say("Теперь я говорю голосом Silero")
+            >>> text = Voice.listen()
+        """
+        if tts is not None:
+            if tts.lower() not in Voice.TTS_ENGINES:
+                raise ValueError(f"❌ Неизвестный движок синтеза '{tts}'. Доступны: {', '.join(Voice.TTS_ENGINES)}")
+            Voice.DEFAULT_TTS = tts.lower()
+        if stt is not None:
+            if stt.lower() not in Voice.STT_ENGINES:
+                raise ValueError(f"❌ Неизвестный движок распознавания '{stt}'. Доступны: {', '.join(Voice.STT_ENGINES)}")
+            Voice.DEFAULT_STT = stt.lower()
+
+    @staticmethod
+    def unload(engine: Optional[str] = None) -> None:
+        """
+        🧹 ВЫГРУЗИТЬ МОДЕЛИ ИЗ ПАМЯТИ
+
+        Параметры:
+            engine (str, optional): Какой движок выгрузить ('silero', 'gigaam', 'vosk', 'whisper', 'pyttsx3').
+                                    Если не указан — выгружаются все.
+
+        Пример:
+            >>> Voice.unload("gigaam")
+        """
+        for key in list(Voice._cache.keys()):
+            if engine is None or key[0] == engine:
+                del Voice._cache[key]
+
+    @staticmethod
+    def list_voices(engine: Optional[str] = None, **options) -> List[str]:
+        """
+        📋 СПИСОК ДОСТУПНЫХ ГОЛОСОВ ДВИЖКА
+
+        Параметры:
+            engine (str, optional): 'gtts' (коды языков), 'silero', 'edge', 'pyttsx3'.
+                                    По умолчанию — Voice.DEFAULT_TTS.
+            **options: model='v5_6_ru' (для silero), locale='ru' (для edge), driver=None (для pyttsx3)
+
+        Возвращает:
+            List[str]: Имена голосов (значения для параметра voice)
+
+        Пример:
+            >>> Voice.list_voices("silero")
+            ['aidar', 'baya', 'kseniya', 'xenia', 'eugene']
+            >>> Voice.list_voices("edge", locale="ru")
+            ['ru-RU-DmitryNeural', 'ru-RU-SvetlanaNeural']
+
+        Примечание:
+            Для 'edge' нужен интернет. Для 'silero' известные модели читаются без скачивания.
+        """
+        engine = (engine or Voice.DEFAULT_TTS).lower()
+        if engine == "gtts":
+            gtts_lang = Voice._import("gtts.lang", "gTTS")
+            return sorted(gtts_lang.tts_langs().keys())
+        if engine == "silero":
+            model = options.get("model", "v5_6_ru")
+            if model in Voice.SILERO_SPEAKERS:
+                return list(Voice.SILERO_SPEAKERS[model])
+            tts = Voice._get_silero(model, options.get("device", "cpu"), options.get("num_threads"))
+            return sorted(tts.speakers)
+        if engine == "edge":
+            import asyncio
+            edge_tts = Voice._import("edge_tts", "edge-tts")
+            locale = str(options.get("locale", "ru")).lower()
+            voices = asyncio.run(edge_tts.list_voices())
+            return sorted(v["ShortName"] for v in voices if str(v.get("Locale", "")).lower().startswith(locale))
+        if engine == "pyttsx3":
+            tts = Voice._get_pyttsx3(options.get("driver"))
+            return [str(v.name) for v in tts.getProperty("voices")]
+        raise ValueError(f"❌ Неизвестный движок синтеза '{engine}'. Доступны: {', '.join(Voice.TTS_ENGINES)}")
+
+    # -------------------------------------------------------------------------
+    # 🔊 ВОСПРОИЗВЕДЕНИЕ
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def play(path: str, block: bool = True, device: Optional[int] = None) -> None:
+        """
+        ▶️ ВОСПРОИЗВЕДЕНИЕ АУДИОФАЙЛА (WAV, MP3, FLAC, OGG)
+
+        Параметры:
+            path (str): Путь к аудиофайлу
+            block (bool): True — ждать конца звука, False — играть в фоне и сразу вернуться
+            device (int, optional): Номер устройства вывода (см. sounddevice.query_devices())
+
+        Исключения:
+            FileNotFoundError: Если файла нет.
+
+        Пример:
+            >>> Voice.play("tts_out.wav")
+            >>> Voice.play("music.mp3", block=False)
+            >>> Voice.stop()
+
+        Примечание:
+            Если sounddevice не установлен, используется pydub (воспроизведение всегда блокирующее).
+        """
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"❌ Файл не найден: {path}")
+        try:
+            sd = Voice._import("sounddevice")
+        except ImportError:
+            sd = None
+        if sd is not None:
+            data, sample_rate = Voice._read_audio(path)
+            sd.play(data, sample_rate, device=device)
+            if block:
+                sd.wait()
+            return
+        from pydub import AudioSegment
+        from pydub.playback import play as pydub_play
+        pydub_play(AudioSegment.from_file(path))
+
+    @staticmethod
+    def stop() -> None:
+        """
+        ⏹️ ОСТАНОВИТЬ ВОСПРОИЗВЕДЕНИЕ (для block=False)
+
+        Пример:
+            >>> Voice.say("Очень длинная речь...", block=False)
+            >>> Voice.stop()
+        """
+        try:
+            Voice._import("sounddevice").stop()
+        except ImportError:
+            pass
+
+    # -------------------------------------------------------------------------
+    # 🗣️ СИНТЕЗ РЕЧИ (TTS)
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def say(text: str, engine: Optional[str] = None, **options) -> Optional[str]:
+        """
+        🔊 ОЗВУЧКА ТЕКСТА ВЫБРАННЫМ ДВИЖКОМ (TTS)
+
+        Параметры:
+            text (str): Текст для озвучивания
+            engine (str, optional): 'gtts', 'silero', 'edge' или 'pyttsx3'.
+                                    По умолчанию — Voice.DEFAULT_TTS ('gtts', как в Manager.say).
+            **options: Любые параметры выбранного say_*() (voice, speed, pitch_shift, save_path и т.д.)
+
+        Возвращает:
+            str или None: Путь сохранённого файла, если указан save_path
+
+        Пример:
+            >>> Voice.say("Привет, мир!")
+            >>> Voice.say("Привет!", engine="silero", voice="xenia", speed=1.1)
+            >>> Voice.say("Сохраню в файл", engine="edge", save_path="hello.mp3", play=False)
+
+        Примечание:
+            Параметры смотри в say_gtts(), say_silero(), say_edge(), say_pyttsx3().
+        """
+        engine = (engine or Voice.DEFAULT_TTS).lower()
+        funcs = {
+            "gtts": Voice.say_gtts,
+            "silero": Voice.say_silero,
+            "edge": Voice.say_edge,
+            "pyttsx3": Voice.say_pyttsx3,
+        }
+        if engine not in funcs:
+            raise ValueError(f"❌ Неизвестный движок синтеза '{engine}'. Доступны: {', '.join(Voice.TTS_ENGINES)}")
+        return funcs[engine](text, **options)
+
+    @staticmethod
+    def say_gtts(text: str, lang: str = "ru", slow: bool = False, tld: str = "com",
+                 lang_check: bool = True, timeout: Optional[float] = None, *,
+                 play: bool = True, save_path: Optional[str] = None, speed: float = 1.0,
+                 pitch_shift: float = 0.0, gain: float = 1.0, block: bool = True) -> Optional[str]:
+        """
+        🌐 СИНТЕЗ РЕЧИ ЧЕРЕЗ GOOGLE TTS (gTTS, ОНЛАЙН)
+
+        Параметры:
+            text (str): Текст для озвучивания
+            lang (str): Язык ('ru', 'en', 'de'...). Список: Voice.list_voices("gtts")
+            slow (bool): Медленное произношение
+            tld (str): Домен Google ('com', 'co.uk', 'com.au'...) — меняет акцент
+            lang_check (bool): Проверять, что язык поддерживается
+            timeout (float, optional): Таймаут запроса в секундах
+            play (bool): Проиграть звук
+            save_path (str, optional): Сохранить в файл (.mp3 или .wav)
+            speed (float): Темп поверх звука (1.0 — обычный, 1.2 — быстрее)
+            pitch_shift (float): Тембр в полутонах (-3 — ниже, +3 — выше)
+            gain (float): Громкость (1.0 — обычная, 0.5 — тише)
+            block (bool): Ждать окончания звука (False — играть в фоне)
+
+        Возвращает:
+            str или None: Путь сохранённого файла, если указан save_path
+
+        Пример:
+            >>> Voice.say_gtts("Привет!")
+            >>> Voice.say_gtts("Hello!", lang="en", tld="co.uk")
+            >>> Voice.say_gtts("Низкий голос", pitch_shift=-4, save_path="low.mp3")
+
+        Примечание:
+            Требуется интернет. У gTTS один голос на язык, поэтому тембр и темп делаются эффектами.
+        """
+        Voice._check_output(play, save_path)
+        gtts = Voice._import("gtts", "gTTS")
+        tmp = Voice._tmp(".mp3")
+        try:
+            gtts.gTTS(text=text, lang=lang, slow=slow, tld=tld,
+                      lang_check=lang_check, timeout=timeout).save(tmp)
+        except Exception:
+            Voice._remove(tmp)
+            raise
+        return Voice._finalize(tmp, save_path=save_path, play=play, speed=speed,
+                               pitch_shift=pitch_shift, gain=gain, block=block)
+
+    @staticmethod
+    def say_silero(text: str, voice: str = "xenia", model: str = "v5_6_ru", sample_rate: int = 48000,
+                   put_accent: bool = True, put_yo: bool = True, put_stress_homo: bool = True,
+                   put_yo_homo: bool = True, ssml: bool = False, prosody_rate: Optional[str] = None,
+                   prosody_pitch: Optional[str] = None, device: str = "cpu",
+                   num_threads: Optional[int] = None, max_chars: int = 800, *,
+                   play: bool = True, save_path: Optional[str] = None, speed: float = 1.0,
+                   pitch_shift: float = 0.0, gain: float = 1.0, block: bool = True) -> Optional[str]:
+        """
+        🧠 СИНТЕЗ РЕЧИ НЕЙРОСЕТЬЮ SILERO (ОФЛАЙН, ЛУЧШИЙ ДЛЯ РУССКОГО)
+
+        Параметры:
+            text (str): Текст для озвучивания (или SSML, если ssml=True)
+            voice (str): Голос: 'aidar', 'baya', 'kseniya', 'xenia', 'eugene' (зависит от модели)
+            model (str): Версия модели ('v5_6_ru', 'v5_5_ru', 'v4_ru'...) или путь к .pt файлу
+            sample_rate (int): Частота звука: 8000, 24000 или 48000
+            put_accent (bool): Автоматически ставить ударения
+            put_yo (bool): Автоматически ставить «ё»
+            put_stress_homo (bool): Ударения в омографах (зАмок / замОк) по контексту
+            put_yo_homo (bool): «ё» в омографах по контексту
+            ssml (bool): True — text это готовый SSML (<speak>...</speak>)
+            prosody_rate (str, optional): Темп силами модели: 'x-slow', 'slow', 'medium', 'fast', 'x-fast'
+            prosody_pitch (str, optional): Тембр силами модели: 'x-low', 'low', 'medium', 'high', 'x-high'
+            device (str): 'cpu' или 'cuda'
+            num_threads (int, optional): Сколько потоков CPU использовать
+            max_chars (int): Длинный текст режется на куски такого размера (по предложениям)
+            play (bool): Проиграть звук
+            save_path (str, optional): Сохранить в файл (.wav или .mp3)
+            speed (float): Темп поверх звука (1.0 — обычный)
+            pitch_shift (float): Тембр в полутонах поверх звука
+            gain (float): Громкость (1.0 — обычная)
+            block (bool): Ждать окончания звука (False — играть в фоне)
+
+        Возвращает:
+            str или None: Путь сохранённого файла, если указан save_path
+
+        Исключения:
+            ValueError: Если голос, частота или значения prosody недопустимы.
+
+        Пример:
+            >>> Voice.say_silero("Привет! Меня зовут Кеша.")
+            >>> Voice.say_silero("Я бас", voice="aidar", prosody_pitch="x-low")
+            >>> Voice.say_silero("Замок на двери", put_stress_homo=True, save_path="out.wav")
+            >>> Voice.say_silero('<speak>Раз<break time="1s"/>два</speak>', ssml=True)
+
+        Примечание:
+            Первый запуск скачивает модель (~100 МБ) в ~/.cache/help_manager/voice.
+            Можно вручную ставить ударения знаком «+» перед гласной: «з+амок».
+            В режиме SSML флаги put_* не передаются. Нужен torch.
+        """
+        Voice._check_output(play, save_path)
+        np = Voice._import("numpy")
+        if sample_rate not in (8000, 24000, 48000):
+            raise ValueError("❌ sample_rate для Silero: 8000, 24000 или 48000")
+        if prosody_rate is not None and prosody_rate not in Voice.SILERO_RATES:
+            raise ValueError(f"❌ prosody_rate: одно из {', '.join(Voice.SILERO_RATES)}")
+        if prosody_pitch is not None and prosody_pitch not in Voice.SILERO_PITCHES:
+            raise ValueError(f"❌ prosody_pitch: одно из {', '.join(Voice.SILERO_PITCHES)}")
+
+        tts = Voice._get_silero(model, device, num_threads)
+        speakers = getattr(tts, "speakers", None)
+        if speakers and voice not in speakers:
+            raise ValueError(f"❌ Голос '{voice}' не найден в модели {model}. Доступные: {', '.join(sorted(speakers))}")
+
+        base = {"speaker": voice, "sample_rate": sample_rate}
+        chunks = [text] if ssml else Voice._split_text(text, max_chars)
+        parts = []
+        for chunk in chunks:
+            if ssml:
+                kwargs = dict(base, ssml_text=chunk)
+            elif prosody_rate or prosody_pitch:
+                from xml.sax.saxutils import escape
+                attrs = ""
+                if prosody_rate:
+                    attrs += f' rate="{prosody_rate}"'
+                if prosody_pitch:
+                    attrs += f' pitch="{prosody_pitch}"'
+                kwargs = dict(base, ssml_text=f"<speak><prosody{attrs}>{escape(chunk)}</prosody></speak>")
+            else:
+                kwargs = dict(base, text=chunk, put_accent=put_accent, put_yo=put_yo,
+                              put_stress_homo=put_stress_homo, put_yo_homo=put_yo_homo)
+            audio = tts.apply_tts(**kwargs)
+            parts.append(np.asarray(audio.numpy() if hasattr(audio, "numpy") else audio, dtype=np.float32))
+            if len(chunks) > 1:
+                parts.append(np.zeros(int(sample_rate * 0.1), dtype=np.float32))   # Короткая пауза между кусками
+
+        tmp = Voice._tmp(".wav")
+        try:
+            Voice._write_audio(tmp, np.concatenate(parts), sample_rate)
+        except Exception:
+            Voice._remove(tmp)
+            raise
+        return Voice._finalize(tmp, save_path=save_path, play=play, speed=speed,
+                               pitch_shift=pitch_shift, gain=gain, block=block)
+
+    @staticmethod
+    def say_edge(text: str, voice: str = "ru-RU-SvetlanaNeural", rate: Union[str, int] = "+0%",
+                 pitch: Union[str, int] = "+0Hz", volume: Union[str, int] = "+0%",
+                 proxy: Optional[str] = None, connect_timeout: int = 10, receive_timeout: int = 60, *,
+                 play: bool = True, save_path: Optional[str] = None, speed: float = 1.0,
+                 pitch_shift: float = 0.0, gain: float = 1.0, block: bool = True) -> Optional[str]:
+        """
+        🪟 СИНТЕЗ РЕЧИ НЕЙРОГОЛОСАМИ MICROSOFT EDGE (edge-tts, ОНЛАЙН)
+
+        Параметры:
+            text (str): Текст для озвучивания
+            voice (str): Голос: 'ru-RU-SvetlanaNeural' (жен.), 'ru-RU-DmitryNeural' (муж.) и другие
+            rate (str или int): Темп движка: 15 → '+15%', -20 → '-20%' или строка '+15%'
+            pitch (str или int): Тембр движка в герцах: -10 → '-10Hz' или строка '+5Hz'
+            volume (str или int): Громкость движка: 10 → '+10%', -30 → '-30%'
+            proxy (str, optional): Адрес прокси, если нужен
+            connect_timeout (int): Таймаут подключения, секунд
+            receive_timeout (int): Таймаут получения данных, секунд
+            play (bool): Проиграть звук
+            save_path (str, optional): Сохранить в файл (.mp3 или .wav)
+            speed (float): Дополнительный темп поверх звука (1.0 — обычный)
+            pitch_shift (float): Дополнительный тембр в полутонах поверх звука
+            gain (float): Дополнительная громкость (1.0 — обычная)
+            block (bool): Ждать окончания звука (False — играть в фоне)
+
+        Возвращает:
+            str или None: Путь сохранённого файла, если указан save_path
+
+        Пример:
+            >>> Voice.say_edge("Привет!")
+            >>> Voice.say_edge("Бодрее и ниже", voice="ru-RU-DmitryNeural", rate=20, pitch=-15)
+            >>> print(Voice.list_voices("edge", locale="ru"))
+
+        Примечание:
+            Требуется интернет. Значения rate, pitch и volume у edge-tts обязательно со знаком (+/-).
+        """
+        Voice._check_output(play, save_path)
+        edge_tts = Voice._import("edge_tts", "edge-tts")
+
+        wanted = {
+            "rate": Voice._edge_value(rate, "%", "rate"),
+            "pitch": Voice._edge_value(pitch, "Hz", "pitch"),
+            "volume": Voice._edge_value(volume, "%", "volume"),
+            "proxy": proxy,
+            "connect_timeout": connect_timeout,
+            "receive_timeout": receive_timeout,
+        }
+        supported = inspect.signature(edge_tts.Communicate.__init__).parameters   # Старые версии без некоторых параметров
+        kwargs = {k: v for k, v in wanted.items() if k in supported}
+
+        tmp = Voice._tmp(".mp3")
+        try:
+            communicate = edge_tts.Communicate(text, voice, **kwargs)
+            if hasattr(communicate, "save_sync"):
+                communicate.save_sync(tmp)
+            else:
+                import asyncio
+                asyncio.run(communicate.save(tmp))
+            if os.path.getsize(tmp) == 0:
+                raise RuntimeError("edge-tts вернул пустой файл (проверь интернет и имя голоса)")
+        except Exception:
+            Voice._remove(tmp)
+            raise
+        return Voice._finalize(tmp, save_path=save_path, play=play, speed=speed,
+                               pitch_shift=pitch_shift, gain=gain, block=block)
+
+    @staticmethod
+    def say_pyttsx3(text: str, voice: Optional[str] = None, rate: Optional[int] = None,
+                    volume: Optional[float] = None, driver: Optional[str] = None, *,
+                    play: bool = True, save_path: Optional[str] = None, speed: float = 1.0,
+                    pitch_shift: float = 0.0, gain: float = 1.0, block: bool = True) -> Optional[str]:
+        """
+        💻 СИНТЕЗ РЕЧИ ГОЛОСАМИ СИСТЕМЫ (pyttsx3, ОФЛАЙН)
+
+        Параметры:
+            text (str): Текст для озвучивания
+            voice (str, optional): Id голоса или кусок его имени ('Irina', 'Pavel', 'russian')
+            rate (int, optional): Темп движка в словах в минуту (обычно ~200)
+            volume (float, optional): Громкость движка от 0.0 до 1.0
+            driver (str, optional): Драйвер: 'sapi5' (Windows), 'nsss' (macOS), 'espeak' (Linux)
+            play (bool): Проиграть звук
+            save_path (str, optional): Сохранить в файл (.wav)
+            speed (float): Темп поверх звука (1.0 — обычный)
+            pitch_shift (float): Тембр в полутонах поверх звука (у самого pyttsx3 тембра нет)
+            gain (float): Громкость поверх звука (1.0 — обычная)
+            block (bool): Ждать окончания звука (при прямом проигрывании pyttsx3 всегда ждёт)
+
+        Возвращает:
+            str или None: Путь сохранённого файла, если указан save_path
+
+        Пример:
+            >>> Voice.say_pyttsx3("Привет!")
+            >>> Voice.say_pyttsx3("Привет!", voice="Irina", rate=170)
+            >>> print(Voice.list_voices("pyttsx3"))
+
+        Примечание:
+            Какие голоса есть, зависит от системы. Русские голоса Windows ставятся в
+            «Параметры → Время и язык → Речь».
+        """
+        Voice._check_output(play, save_path)
+        engine = Voice._get_pyttsx3(driver)
+        if voice:
+            engine.setProperty("voice", Voice._pick_pyttsx3_voice(engine, voice))
+        if rate is not None:
+            engine.setProperty("rate", int(rate))
+        if volume is not None:
+            engine.setProperty("volume", max(0.0, min(1.0, float(volume))))
+
+        direct = play and not save_path and speed == 1.0 and pitch_shift == 0.0 and gain == 1.0
+        if direct:
+            engine.say(text)
+            engine.runAndWait()
+            return None
+
+        tmp = Voice._tmp(".wav")
+        try:
+            engine.save_to_file(text, tmp)
+            engine.runAndWait()
+            if os.path.getsize(tmp) == 0:
+                raise RuntimeError("pyttsx3 не создал аудиофайл")
+        except Exception:
+            Voice._remove(tmp)
+            raise
+        return Voice._finalize(tmp, save_path=save_path, play=play, speed=speed,
+                               pitch_shift=pitch_shift, gain=gain, block=block)
+
+    # -------------------------------------------------------------------------
+    # 🎤 ЗАПИСЬ И РАСПОЗНАВАНИЕ РЕЧИ (STT)
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def record(seconds: float = 5.0, path: Optional[str] = None, sample_rate: int = 16000,
+               input_device: Optional[int] = None, stop_on_silence: bool = False,
+               silence_threshold: float = 0.01, silence_seconds: float = 1.0) -> str:
+        """
+        🔴 ЗАПИСЬ С МИКРОФОНА В WAV
+
+        Параметры:
+            seconds (float): Максимальная длительность записи
+            path (str, optional): Куда сохранить. Если не указан — создаётся временный файл
+            sample_rate (int): Частота (16000 подходит для распознавания)
+            input_device (int, optional): Номер микрофона (см. sounddevice.query_devices())
+            stop_on_silence (bool): Остановиться, когда фраза закончилась и наступила тишина
+            silence_threshold (float): Громкость (0..1), ниже которой считается тишиной
+            silence_seconds (float): Сколько секунд тишины после речи означают конец фразы
+
+        Возвращает:
+            str: Путь к записанному WAV (временный файл удаляй сам, если не указывал path)
+
+        Пример:
+            >>> wav = Voice.record(5, "my_voice.wav")
+            >>> wav = Voice.record(15, stop_on_silence=True)   # до конца фразы, но не дольше 15 с
+
+        Примечание:
+            Если stop_on_silence=True, а речи не было, запись идёт все seconds секунд.
+        """
+        np = Voice._import("numpy")
+        sd = Voice._import("sounddevice")
+        step = 0.1
+        block_size = max(1, int(sample_rate * step))
+        total_blocks = max(1, int(round(seconds / step)))
+        frames: List[Any] = []
+        heard = False
+        silent_for = 0.0
+
+        with sd.InputStream(samplerate=sample_rate, channels=1, dtype="float32",
+                            device=input_device, blocksize=block_size) as stream:
+            for _ in range(total_blocks):
+                data, _overflow = stream.read(block_size)
+                frames.append(np.array(data, dtype=np.float32).reshape(-1))
+                if stop_on_silence:
+                    level = float(np.sqrt(np.mean(frames[-1] ** 2)))
+                    if level >= silence_threshold:
+                        heard = True
+                        silent_for = 0.0
+                    elif heard:
+                        silent_for += step
+                        if silent_for >= silence_seconds:
+                            break
+
+        out = path or Voice._tmp(".wav")
+        Voice._write_audio(out, np.concatenate(frames), sample_rate)
+        return out
+
+    @staticmethod
+    def listen(engine: Optional[str] = None, seconds: int = 5, **options) -> str:
+        """
+        🎤 РАСПОЗНАВАНИЕ РЕЧИ ВЫБРАННЫМ ДВИЖКОМ (STT)
+
+        Параметры:
+            engine (str, optional): 'google', 'vosk', 'gigaam' или 'whisper'.
+                                    По умолчанию — Voice.DEFAULT_STT ('google', как в Manager.listen_text).
+            seconds (int): Сколько секунд слушать
+            **options: Любые параметры выбранного listen_*() (language, model, audio_path и т.д.)
+
+        Возвращает:
+            str: Распознанный текст или пустая строка, если ничего не услышано
+
+        Пример:
+            >>> text = Voice.listen()
+            >>> text = Voice.listen("gigaam", seconds=8, model="v3_e2e_ctc")
+            >>> text = Voice.listen("vosk", grammar=["включи свет", "выключи свет"])
+
+        Примечание:
+            Параметры смотри в listen_google(), listen_vosk(), listen_gigaam(), listen_whisper().
+        """
+        engine = (engine or Voice.DEFAULT_STT).lower()
+        funcs = {
+            "google": Voice.listen_google,
+            "vosk": Voice.listen_vosk,
+            "gigaam": Voice.listen_gigaam,
+            "whisper": Voice.listen_whisper,
+        }
+        if engine not in funcs:
+            raise ValueError(f"❌ Неизвестный движок распознавания '{engine}'. Доступны: {', '.join(Voice.STT_ENGINES)}")
+        return funcs[engine](seconds=seconds, **options)
+
+    @staticmethod
+    def transcribe_file(path: str, engine: Optional[str] = None, **options) -> str:
+        """
+        📄 РАСПОЗНАВАНИЕ РЕЧИ ИЗ АУДИОФАЙЛА
+
+        Параметры:
+            path (str): Путь к аудиофайлу (wav, mp3, ogg, m4a...)
+            engine (str, optional): 'google', 'vosk', 'gigaam' или 'whisper'
+            **options: Параметры выбранного listen_*() (model, language и т.д.)
+
+        Возвращает:
+            str: Распознанный текст
+
+        Исключения:
+            FileNotFoundError: Если файла нет.
+
+        Пример:
+            >>> text = Voice.transcribe_file("my_voice.wav", engine="gigaam")
+            >>> text = Voice.transcribe_file("interview.mp3", engine="whisper", model="small")
+
+        Примечание:
+            GigaAM сам режет записи длиннее 25 секунд на куски по паузам.
+            Google подходит только для коротких записей (до ~1 минуты).
+        """
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"❌ Файл не найден: {path}")
+        return Voice.listen(engine, audio_path=path, **options)
+
+    @staticmethod
+    def transcribe_words(path: str, engine: str = "gigaam", **options) -> List[Dict[str, Any]]:
+        """
+        ⏱️ РАСПОЗНАВАНИЕ С ТАЙМКОДАМИ КАЖДОГО СЛОВА
+
+        Параметры:
+            path (str): Путь к аудиофайлу
+            engine (str): 'gigaam', 'vosk' или 'whisper' (у Google таймкодов нет)
+            **options: Параметры выбранного listen_*() (model, language и т.д.)
+
+        Возвращает:
+            List[dict]: [{"word": "привет", "start": 0.52, "end": 0.91}, ...] (время в секундах)
+
+        Пример:
+            >>> for w in Voice.transcribe_words("my_voice.wav"):
+            ...     print(f"{w['start']:.2f}–{w['end']:.2f} {w['word']}")
+        """
+        if engine.lower() not in ("gigaam", "vosk", "whisper"):
+            raise ValueError("❌ Таймкоды слов умеют: gigaam, vosk, whisper")
+        words: List[Dict[str, Any]] = []
+        Voice.transcribe_file(path, engine=engine, words_out=words, **options)
+        return words
+
+    @staticmethod
+    def listen_google(seconds: int = 5, language: str = "ru", adjust_noise: bool = True,
+                      noise_duration: float = 1.0, timeout: Optional[float] = None,
+                      phrase_time_limit: Optional[float] = None, energy_threshold: Optional[float] = None,
+                      dynamic_energy: bool = True, pause_threshold: float = 0.8,
+                      input_device: Optional[int] = None, key: Optional[str] = None,
+                      audio_path: Optional[str] = None, raise_errors: bool = False) -> str:
+        """
+        🌐 РАСПОЗНАВАНИЕ РЕЧИ ЧЕРЕЗ GOOGLE (ОНЛАЙН)
+
+        Параметры:
+            seconds (int): Сколько секунд слушать (используется, если timeout/phrase_time_limit не заданы)
+            language (str): Язык: 'ru', 'en' или полный код 'ru-RU', 'en-US'
+            adjust_noise (bool): Подстроиться под фоновый шум перед записью
+            noise_duration (float): Сколько секунд замерять шум
+            timeout (float, optional): Сколько ждать начала речи (по умолчанию = seconds)
+            phrase_time_limit (float, optional): Максимальная длина фразы (по умолчанию = seconds)
+            energy_threshold (float, optional): Порог громкости для начала речи (по умолчанию авто)
+            dynamic_energy (bool): Автоматически менять порог громкости
+            pause_threshold (float): Сколько секунд тишины считается концом фразы
+            input_device (int, optional): Номер микрофона
+            key (str, optional): Свой ключ Google Speech API (по умолчанию общий)
+            audio_path (str, optional): Распознать файл вместо микрофона
+            raise_errors (bool): True — выбрасывать ошибки, False — печатать и вернуть ""
+
+        Возвращает:
+            str: Распознанный текст или пустая строка
+
+        Пример:
+            >>> text = Voice.listen_google(seconds=6)
+            >>> text = Voice.listen_google(language="en", pause_threshold=1.2)
+
+        Примечание:
+            Требуется интернет и микрофон (SpeechRecognition + PyAudio).
+            Тишина и непонятная речь дают пустую строку, а не ошибку.
+        """
+        sr = Voice._import("speech_recognition", "SpeechRecognition")
+        lang = Voice._google_lang(language)
+        wav = None
+        try:
+            recognizer = sr.Recognizer()
+            if audio_path:
+                wav = Voice._to_mono_16k(audio_path)
+                with sr.AudioFile(wav) as source:
+                    audio = recognizer.record(source)
+            else:
+                recognizer.dynamic_energy_threshold = dynamic_energy
+                recognizer.pause_threshold = pause_threshold
+                if energy_threshold is not None:
+                    recognizer.energy_threshold = energy_threshold
+                with sr.Microphone(device_index=input_device) as source:
+                    if adjust_noise:
+                        recognizer.adjust_for_ambient_noise(source, duration=noise_duration)
+                    audio = recognizer.listen(
+                        source,
+                        timeout=timeout if timeout is not None else seconds,
+                        phrase_time_limit=phrase_time_limit if phrase_time_limit is not None else seconds,
+                    )
+            return recognizer.recognize_google(audio, key=key, language=lang)
+        except (sr.WaitTimeoutError, sr.UnknownValueError):
+            return ""
+        except Exception as e:
+            if raise_errors:
+                raise
+            print(f"❌ Ошибка Google STT: {e}")
+            return ""
+        finally:
+            Voice._remove(wav)
+
+    @staticmethod
+    def listen_vosk(seconds: int = 5, model: Optional[str] = None, language: str = "ru",
+                    sample_rate: int = 16000, input_device: Optional[int] = None,
+                    grammar: Optional[List[str]] = None, max_alternatives: int = 0,
+                    partial_callback: Optional[Callable[[str], None]] = None,
+                    stop_on_phrase: bool = True, audio_path: Optional[str] = None,
+                    words_out: Optional[List[Dict[str, Any]]] = None,
+                    raise_errors: bool = False) -> str:
+        """
+        📦 РАСПОЗНАВАНИЕ РЕЧИ ЧЕРЕЗ VOSK (ОФЛАЙН, ПОТОКОВОЕ)
+
+        Параметры:
+            seconds (int): Максимум секунд прослушивания
+            model (str, optional): Папка со скачанной моделью ИЛИ имя модели для автозагрузки
+                                   ('vosk-model-small-ru-0.22', 'vosk-model-ru-0.42').
+                                   Если не указан — берётся небольшая модель по языку.
+            language (str): Язык для автоподбора модели ('ru', 'en'...)
+            sample_rate (int): Частота микрофона (16000 подходит большинству моделей)
+            input_device (int, optional): Номер микрофона
+            grammar (list, optional): Список разрешённых фраз — Vosk распознаёт ТОЛЬКО их
+                                      (точнее для команд). Неизвестное будет как '[unk]'.
+            max_alternatives (int): Сколько вариантов распознавания учитывать (0 — один лучший)
+            partial_callback (callable, optional): Функция, которой передаётся промежуточный текст по мере речи
+            stop_on_phrase (bool): Вернуть результат сразу после первой законченной фразы
+            audio_path (str, optional): Распознать файл вместо микрофона
+            words_out (list, optional): Сюда добавятся слова с таймкодами {"word", "start", "end"}
+            raise_errors (bool): True — выбрасывать ошибки, False — печатать и вернуть ""
+
+        Возвращает:
+            str: Распознанный текст или пустая строка
+
+        Пример:
+            >>> text = Voice.listen_vosk(seconds=8)
+            >>> cmd = Voice.listen_vosk(grammar=["включи свет", "выключи свет", "[unk]"])
+            >>> Voice.listen_vosk(partial_callback=lambda t: print("…", t))
+
+        Примечание:
+            Модели: https://alphacephei.com/vosk/models. Первый запуск с model=None или
+            именем скачивает модель в ~/.cache/vosk.
+        """
+        vosk = Voice._import("vosk")
+
+        def text_of(raw: str) -> str:
+            data = json.loads(raw)
+            if "text" in data:
+                return data["text"]
+            alternatives = data.get("alternatives") or [{}]
+            return alternatives[0].get("text", "")
+
+        def collect(raw: str) -> None:
+            if words_out is not None:
+                for item in json.loads(raw).get("result", []):
+                    words_out.append({"word": item["word"], "start": item["start"], "end": item["end"]})
+
+        wav = None
+        try:
+            vosk_model = Voice._get_vosk(model, language)
+            rate = 16000 if audio_path else sample_rate
+            if grammar:
+                recognizer = vosk.KaldiRecognizer(vosk_model, rate, json.dumps(grammar, ensure_ascii=False))
+            else:
+                recognizer = vosk.KaldiRecognizer(vosk_model, rate)
+            if words_out is not None:
+                recognizer.SetWords(True)
+            if max_alternatives > 0:
+                recognizer.SetMaxAlternatives(int(max_alternatives))
+
+            texts: List[str] = []
+
+            if audio_path:
+                import wave
+                wav = Voice._to_mono_16k(audio_path)
+                with wave.open(wav, "rb") as handle:
+                    while True:
+                        chunk = handle.readframes(4000)
+                        if not chunk:
+                            break
+                        if recognizer.AcceptWaveform(chunk):
+                            raw = recognizer.Result()
+                            collect(raw)
+                            if text_of(raw):
+                                texts.append(text_of(raw))
+                raw = recognizer.FinalResult()
+                collect(raw)
+                if text_of(raw):
+                    texts.append(text_of(raw))
+                return " ".join(texts)
+
+            sd = Voice._import("sounddevice")
+            block_size = max(1, int(sample_rate * 0.1))
+            deadline = time.time() + seconds
+            last_partial = ""
+            with sd.RawInputStream(samplerate=sample_rate, blocksize=block_size, device=input_device,
+                                   dtype="int16", channels=1) as stream:
+                while time.time() < deadline:
+                    data, _overflow = stream.read(block_size)
+                    if recognizer.AcceptWaveform(bytes(data)):
+                        raw = recognizer.Result()
+                        collect(raw)
+                        phrase = text_of(raw)
+                        if phrase:
+                            texts.append(phrase)
+                            if stop_on_phrase:
+                                return " ".join(texts)
+                    elif partial_callback:
+                        partial = json.loads(recognizer.PartialResult()).get("partial", "")
+                        if partial and partial != last_partial:
+                            last_partial = partial
+                            partial_callback(partial)
+            raw = recognizer.FinalResult()
+            collect(raw)
+            if text_of(raw):
+                texts.append(text_of(raw))
+            return " ".join(texts)
+        except Exception as e:
+            if raise_errors:
+                raise
+            print(f"❌ Ошибка Vosk: {e}")
+            return ""
+        finally:
+            Voice._remove(wav)
+
+    @staticmethod
+    def listen_gigaam(seconds: int = 5, model: str = "v3_ctc", device: Optional[str] = None,
+                      fp16_encoder: bool = True, use_flash: bool = False,
+                      download_root: Optional[str] = None, stop_on_silence: bool = True,
+                      silence_threshold: float = 0.01, silence_seconds: float = 1.0,
+                      input_device: Optional[int] = None, audio_path: Optional[str] = None,
+                      words_out: Optional[List[Dict[str, Any]]] = None,
+                      raise_errors: bool = False) -> str:
+        """
+        🧠 РАСПОЗНАВАНИЕ РЕЧИ ЧЕРЕЗ GigaAM (СБЕР, ОФЛАЙН)
+
+        Параметры:
+            seconds (int): Максимум секунд записи с микрофона
+            model (str): Модель: 'v3_ctc' (по умолчанию), 'v3_rnnt', 'v3_e2e_ctc' и 'v3_e2e_rnnt'
+                         (с пунктуацией и нормализацией), 'v2_ctc', 'multilingual_ctc'...
+                         Список: Voice.GIGAAM_MODELS. Можно указать путь к дообученному .ckpt
+            device (str, optional): 'cpu' или 'cuda' (по умолчанию cuda, если есть)
+            fp16_encoder (bool): Половинная точность энкодера (работает только на GPU)
+            use_flash (bool): Flash Attention (нужна библиотека flash_attn и GPU)
+            download_root (str, optional): Куда качать веса (по умолчанию ~/.cache/gigaam)
+            stop_on_silence (bool): Остановить запись, когда фраза закончилась
+            silence_threshold (float): Громкость (0..1), ниже которой считается тишиной
+            silence_seconds (float): Сколько секунд тишины означают конец фразы
+            input_device (int, optional): Номер микрофона
+            audio_path (str, optional): Распознать файл вместо микрофона
+            words_out (list, optional): Сюда добавятся слова с таймкодами {"word", "start", "end"}
+            raise_errors (bool): True — выбрасывать ошибки, False — печатать и вернуть ""
+
+        Возвращает:
+            str: Распознанный текст или пустая строка
+
+        Пример:
+            >>> text = Voice.listen_gigaam(seconds=10)
+            >>> text = Voice.listen_gigaam(model="v3_e2e_ctc")     # с пунктуацией
+            >>> text = Voice.listen_gigaam(audio_path="my_voice.wav", device="cpu")
+
+        Примечание:
+            Нужны torch и пакет gigaam (версия 0.2.0 с GitHub, не с PyPI) и ffmpeg.
+            Записи длиннее ~24 секунд режутся на куски по паузам автоматически.
+        """
+        path, is_temp = audio_path, False
+        try:
+            if not path:
+                path = Voice.record(seconds, sample_rate=16000, input_device=input_device,
+                                    stop_on_silence=stop_on_silence, silence_threshold=silence_threshold,
+                                    silence_seconds=silence_seconds)
+                is_temp = True
+            gm = Voice._get_gigaam(model, device, fp16_encoder, use_flash, download_root)
+            want_words = words_out is not None
+
+            def unpack(result, offset: float) -> Tuple[str, List[Dict[str, Any]]]:
+                text = getattr(result, "text", result)
+                words = []
+                for w in (getattr(result, "words", None) or []):
+                    words.append({"word": w.text, "start": w.start + offset, "end": w.end + offset})
+                return str(text).strip(), words
+
+            def run(file_path: str):
+                return gm.transcribe(file_path, word_timestamps=True) if want_words else gm.transcribe(file_path)
+
+            data, sample_rate = Voice._read_audio(path)
+            mono = data if data.ndim == 1 else data.mean(axis=1)
+            if len(mono) / float(sample_rate) <= 24.0:
+                text, words = unpack(run(path), 0.0)
+            else:
+                parts, words = [], []
+                for start, end in Voice._split_audio(mono, sample_rate, 20.0):
+                    piece = Voice._tmp(".wav")
+                    try:
+                        Voice._write_audio(piece, mono[start:end], sample_rate)
+                        chunk_text, chunk_words = unpack(run(piece), start / float(sample_rate))
+                    finally:
+                        Voice._remove(piece)
+                    if chunk_text:
+                        parts.append(chunk_text)
+                        words.extend(chunk_words)
+                text = " ".join(parts)
+            if words_out is not None:
+                words_out.extend(words)
+            return text
+        except ImportError:
+            raise
+        except Exception as e:
+            if raise_errors:
+                raise
+            print(f"❌ Ошибка GigaAM: {e}")
+            return ""
+        finally:
+            if is_temp:
+                Voice._remove(path)
+
+    @staticmethod
+    def listen_whisper(seconds: int = 5, model: str = "small", language: Optional[str] = "ru",
+                       device: str = "auto", compute_type: str = "default", beam_size: int = 5,
+                       vad_filter: bool = True, initial_prompt: Optional[str] = None,
+                       temperature: float = 0.0, condition_on_previous_text: bool = False,
+                       no_speech_threshold: float = 0.6, cpu_threads: int = 0,
+                       download_root: Optional[str] = None, stop_on_silence: bool = True,
+                       silence_threshold: float = 0.01, silence_seconds: float = 1.0,
+                       input_device: Optional[int] = None, audio_path: Optional[str] = None,
+                       words_out: Optional[List[Dict[str, Any]]] = None,
+                       raise_errors: bool = False) -> str:
+        """
+        🌀 РАСПОЗНАВАНИЕ РЕЧИ ЧЕРЕЗ WHISPER (faster-whisper, ОФЛАЙН)
+
+        Параметры:
+            seconds (int): Максимум секунд записи с микрофона
+            model (str): Размер модели: 'tiny', 'base', 'small', 'medium', 'large-v3' или путь к своей
+            language (str, optional): Язык ('ru', 'en'...). None — определить автоматически
+            device (str): 'auto', 'cpu' или 'cuda'
+            compute_type (str): Точность: 'default', 'int8' (быстро на CPU), 'float16' (GPU)
+            beam_size (int): Ширина поиска (больше — точнее, но медленнее)
+            vad_filter (bool): Отрезать тишину перед распознаванием (меньше «галлюцинаций»)
+            initial_prompt (str, optional): Подсказка со словами/именами, которые встретятся ("Кеша, Юсуф")
+            temperature (float): 0.0 — самый точный результат
+            condition_on_previous_text (bool): Учитывать предыдущий текст (на длинных записях может зацикливаться)
+            no_speech_threshold (float): Порог, ниже которого фрагмент считается тишиной
+            cpu_threads (int): Число потоков CPU (0 — авто)
+            download_root (str, optional): Куда качать веса
+            stop_on_silence (bool): Остановить запись, когда фраза закончилась
+            silence_threshold (float): Громкость (0..1), ниже которой считается тишиной
+            silence_seconds (float): Сколько секунд тишины означают конец фразы
+            input_device (int, optional): Номер микрофона
+            audio_path (str, optional): Распознать файл вместо микрофона
+            words_out (list, optional): Сюда добавятся слова с таймкодами {"word", "start", "end"}
+            raise_errors (bool): True — выбрасывать ошибки, False — печатать и вернуть ""
+
+        Возвращает:
+            str: Распознанный текст или пустая строка
+
+        Пример:
+            >>> text = Voice.listen_whisper(seconds=10)
+            >>> text = Voice.listen_whisper(model="medium", compute_type="int8", initial_prompt="Кеша, Юсуф")
+            >>> text = Voice.listen_whisper(audio_path="interview.mp3", language=None)
+
+        Примечание:
+            Первый запуск скачивает модель (small ≈ 500 МБ). Файлы любого формата читает
+            сама библиотека, ffmpeg для этого не нужен.
+        """
+        path, is_temp = audio_path, False
+        try:
+            if not path:
+                path = Voice.record(seconds, sample_rate=16000, input_device=input_device,
+                                    stop_on_silence=stop_on_silence, silence_threshold=silence_threshold,
+                                    silence_seconds=silence_seconds)
+                is_temp = True
+            wm = Voice._get_whisper(model, device, compute_type, cpu_threads, download_root)
+            segments, _info = wm.transcribe(
+                path, language=language, beam_size=beam_size, vad_filter=vad_filter,
+                initial_prompt=initial_prompt, temperature=temperature,
+                condition_on_previous_text=condition_on_previous_text,
+                no_speech_threshold=no_speech_threshold, word_timestamps=words_out is not None,
+            )
+            texts = []
+            for segment in segments:
+                piece = segment.text.strip()
+                if piece:
+                    texts.append(piece)
+                if words_out is not None:
+                    for w in (segment.words or []):
+                        words_out.append({"word": w.word.strip(), "start": w.start, "end": w.end})
+            return " ".join(texts)
+        except ImportError:
+            raise
+        except Exception as e:
+            if raise_errors:
+                raise
+            print(f"❌ Ошибка Whisper: {e}")
+            return ""
+        finally:
+            if is_temp:
+                Voice._remove(path)
+
+# =============================================================================
+# КЛАСС GigaChat – ИИ ОТ СБЕРБАНКА
+# =============================================================================
+
+
+    """
+    🤖 ИНТЕГРАЦИЯ С GigaChat (СБЕР): ЧАТ, ИЗОБРАЖЕНИЯ, ФАЙЛЫ, ТОКЕНЫ И ОЧИСТКА РЕЧИ
+
+    Класс позволяет общаться с нейросетью GigaChat (с памятью диалога и потоковым ответом),
+    отправлять изображения и документы, получать описание картинок, генерировать изображения,
+    считать токены и автоматически исправлять распознанную речь (убирать заикания, слова-паразиты).
+
+    Токен доступа живёт 30 минут: класс сам обновляет его и повторяет запрос при ошибке 401.
+
+    📌 ПРИМЕР:
+        >>> ai = GigaChat(client_id="your_id", client_secret="your_secret")
+        >>> answer = ai.chat("Как дела?")
+        >>> cleaned = ai.clean_speech("я э-э-э хочу пиццу")
+        >>> print(ai.describe_image("photo.jpg"))
+        >>> print(ai.ask_image("Сколько людей на фото?", "photo.jpg"))
+
+    🎯 ОСНОВНЫЕ МЕТОДЫ:
+        - chat(): общение с ИИ (параметры модели, память, картинки, файлы)
+        - chat_stream(): ответ по кусочкам, по мере генерации
+        - ask_image() / describe_image(): вопрос по изображению и его описание
+        - generate_image(): создание изображения по тексту
+        - clean_speech(): очистка речи от шумов и повторов
+        - upload_file() / list_files() / get_file_info() / download_file() / delete_file(): файлы
+        - count_tokens() / get_balance() / list_models() / embeddings(): служебные функции
+        - reset_history(): очистить память диалога
+
+    🔑 ДОСТУП:
+        client_id + client_secret ИЛИ готовый «ключ авторизации» (credentials) из кабинета Сбера.
+        Переменные окружения: GIGACHAT_CLIENT_ID, GIGACHAT_CLIENT_SECRET, GIGACHAT_CREDENTIALS.
+    """
+
+    API_URL = "https://gigachat.devices.sberbank.ru/api/v1"     # Прежний адрес (работает)
+    API_URL_NEW = "https://api.giga.chat/v1"                     # Новый адрес из документации Сбера
+    AUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
+
+    MAX_IMAGE_BYTES = 15 * 1024 * 1024     # Лимит изображения — 15 МБ
+    MAX_FILE_BYTES = 40 * 1024 * 1024      # Лимит текстового документа — 40 МБ
+    MAX_IMAGES = 10                        # Не больше 10 изображений в одном запросе
+    IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".gif", ".webp")
+
+    IMAGE_PROMPTS = {
+        "brief": "Опиши изображение одним-двумя предложениями.",
+        "detailed": "Подробно опиши, что изображено на картинке: объекты, людей, цвета, обстановку и надписи.",
+        "alt": "Напиши короткий alt-текст для этого изображения (до 120 символов).",
+        "text": "Перепиши весь текст, который виден на изображении. Если текста нет — так и скажи.",
+        "objects": "Перечисли списком все объекты, которые есть на изображении.",
+    }
+
+    def __init__(self, client_id: Optional[str] = None, client_secret: Optional[str] = None,
+                 verify_ssl: bool = False, *, credentials: Optional[str] = None,
+                 model: str = "GigaChat", scope: str = "GIGACHAT_API_PERS",
+                 base_url: Optional[str] = None, auth_url: Optional[str] = None,
+                 timeout: int = 30, ca_bundle: Optional[str] = None, system_prompt: str = "",
+                 remember: bool = False, max_history: int = 20, max_retries: int = 2):
+        """
+        Инициализация клиента GigaChat.
+
+        Параметры:
+            client_id (str, optional): ID клиента из кабинета разработчика Сбера.
+                                       По умолчанию берётся из переменной окружения GIGACHAT_CLIENT_ID.
+            client_secret (str, optional): Секрет клиента.
+                                           По умолчанию из переменной окружения GIGACHAT_CLIENT_SECRET.
+            verify_ssl (bool): Проверять SSL-сертификаты (True — безопасно, False — только для отладки).
+            credentials (str, optional): Готовый ключ авторизации (Base64 от client_id:client_secret).
+                                         Вместо пары client_id/client_secret. Или переменная GIGACHAT_CREDENTIALS.
+            model (str): Модель по умолчанию ('GigaChat', 'GigaChat-2-Max' и др., список: list_models()).
+            scope (str): Тип доступа: 'GIGACHAT_API_PERS' (физлица), 'GIGACHAT_API_B2B', 'GIGACHAT_API_CORP'.
+            base_url (str, optional): Адрес API. Новый адрес Сбера: GigaChat.API_URL_NEW ('https://api.giga.chat/v1').
+            auth_url (str, optional): Адрес получения токена (по умолчанию GigaChat.AUTH_URL).
+            timeout (int): Таймаут запросов в секундах.
+            ca_bundle (str, optional): Путь к сертификату Минцифры (.cer/.pem) для проверки SSL вместо verify_ssl.
+            system_prompt (str): Системный промпт по умолчанию для всех запросов.
+            remember (bool): True — запоминать диалог (история подставляется в каждый запрос).
+            max_history (int): Сколько последних сообщений хранить в памяти диалога.
+            max_retries (int): Сколько раз повторять запрос при 429/502/503/504.
+
+        Исключения:
+            ValueError: Если ни client_id/client_secret, ни credentials не указаны и не найдены в окружении.
+        """
+        import uuid
+        self.client_id = client_id or os.environ.get("GIGACHAT_CLIENT_ID")
+        self.client_secret = client_secret or os.environ.get("GIGACHAT_CLIENT_SECRET")
+        self.credentials = credentials
+        if not self.credentials and not (self.client_id and self.client_secret):
+            self.credentials = os.environ.get("GIGACHAT_CREDENTIALS")
+        self.verify_ssl = verify_ssl
+
+        if not self.credentials and (not self.client_id or not self.client_secret):
+            raise ValueError("Токены не найдены. Передайте client_id/client_secret (или credentials) или задайте переменные окружения GIGACHAT_CLIENT_ID и GIGACHAT_CLIENT_SECRET (или GIGACHAT_CREDENTIALS).")
+
+        self.model = model
+        self.scope = scope
+        self.base_url = (base_url or self.API_URL).rstrip("/")
+        self.auth_url = auth_url or self.AUTH_URL
+        self.timeout = timeout
+        self.ca_bundle = ca_bundle
+        self.system_prompt = system_prompt
+        self.remember = remember
+        self.max_history = max_history
+        self.max_retries = max_retries
+
+        self.session_id = str(uuid.uuid4())      # Один ID сессии на весь диалог
+        self.history: List[Dict[str, Any]] = []  # Память диалога (без системного промпта)
+        self.last_usage: Optional[Dict[str, Any]] = None     # Токены последнего ответа
+        self.last_response: Optional[Dict[str, Any]] = None  # Полный JSON последнего ответа
+        self.last_files: List[str] = []          # ID файлов, приложенных к последнему запросу
+        self._token = None
+        self._token_expires_at = 0.0
+        self._file_cache: Dict[Any, str] = {}    # Чтобы не загружать одну картинку дважды
+        self._image_ids: set = set()
+
+    # ---------- Внутренние методы ----------
+
+    def _verify(self):
+        """Что передавать в requests как verify (внутренний метод)."""
+        return self.ca_bundle if self.ca_bundle else self.verify_ssl
+
+    def _silence_ssl_warnings(self) -> None:
+        """Отключает предупреждения urllib3, если SSL не проверяется (внутренний метод)."""
+        if not self.verify_ssl and not self.ca_bundle:
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    @staticmethod
+    def _parse_expires(value: Any) -> float:
+        """Время окончания токена в секундах Unix (внутренний метод)."""
+        try:
+            moment = float(value)
+            return moment / 1000.0 if moment > 1e11 else moment    # Сбер отдаёт миллисекунды
+        except (TypeError, ValueError):
+            return time.time() + 1700                               # Токен живёт 30 минут
+
+    def _get_token(self) -> None:
+        """Получает токен доступа к API GigaChat (внутренний метод)."""
+        import base64
+        import uuid
+        from urllib.parse import urlencode
+        import requests
+        self._silence_ssl_warnings()
+
+        key = self.credentials or base64.b64encode(f"{self.client_id}:{self.client_secret}".encode()).decode()
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "Authorization": f"Basic {key}",
+            "RqUID": str(uuid.uuid4()),
+        }
+        data = {"scope": self.scope}
+
+        resp = requests.post(self.auth_url, headers=headers, data=urlencode(data),
+                             verify=self._verify(), timeout=self.timeout)
+        if resp.status_code == 200:
+            payload = resp.json()
+            self._token = payload.get("access_token")
+            self._token_expires_at = self._parse_expires(payload.get("expires_at"))
+        else:
+            raise GigaChatError(f"Ошибка получения токена: {resp.status_code} - {resp.text}",
+                                resp.status_code, resp.text)
+
+    def _ensure_token(self) -> None:
+        """Обновляет токен, если его нет или он скоро истечёт (внутренний метод)."""
+        if not self._token or time.time() >= self._token_expires_at - 60:
+            self._get_token()
+
+    def _request(self, method: str, path: str, *, json_body: Optional[Dict] = None,
+                 files: Optional[Dict] = None, data: Optional[Dict] = None,
+                 stream: bool = False, timeout: Optional[int] = None):
+        """
+        Запрос к API с токеном, обновлением при 401 и повтором при 429/502/503/504 (внутренний метод).
+
+        Исключения:
+            GigaChatError: Если сервер вернул ошибку.
+        """
+        import requests
+        self._silence_ssl_warnings()
+        refreshed = False
+        attempt = 0
+        while True:
+            self._ensure_token()
+            headers = {"Authorization": f"Bearer {self._token}", "X-Session-ID": self.session_id}
+            resp = requests.request(method, f"{self.base_url}{path}", headers=headers, json=json_body,
+                                    files=files, data=data, stream=stream, verify=self._verify(),
+                                    timeout=timeout or self.timeout)
+            if resp.status_code == 401 and not refreshed:
+                refreshed = True
+                self._token = None            # Токен протух — получим новый и повторим
+                continue
+            if resp.status_code in (429, 502, 503, 504) and attempt < self.max_retries:
+                attempt += 1
+                try:
+                    delay = float(resp.headers.get("Retry-After", 2 ** attempt))
+                except ValueError:
+                    delay = 2 ** attempt
+                time.sleep(min(delay, 30))
+                continue
+            if resp.status_code >= 400:
+                raise GigaChatError(f"GigaChat API error {resp.status_code}: {resp.text}",
+                                    resp.status_code, resp.text)
+            return resp
+
+    @staticmethod
+    def _as_list(value: Any) -> List[Any]:
+        """None → [], одиночное значение → [значение] (внутренний метод)."""
+        if value is None:
+            return []
+        return list(value) if isinstance(value, (list, tuple)) else [value]
+
+    def _resolve_file(self, item: Any) -> str:
+        """Путь, ссылка или готовый ID файла → ID файла в хранилище (внутренний метод)."""
+        import re
+        text = str(item)
+        if re.fullmatch(r"[0-9a-fA-F-]{36}", text) and not os.path.exists(text):
+            return text                                    # Это уже ID загруженного файла
+        if text.lower().startswith(("http://", "https://")):
+            import requests
+            reply = requests.get(text, timeout=self.timeout)
+            reply.raise_for_status()
+            name = os.path.basename(text.split("?")[0]) or "image.jpg"
+            suffix = os.path.splitext(name)[1] or ".jpg"
+            fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(reply.content)
+                return self.upload_file(tmp_path)
+            finally:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+        return self.upload_file(text)
+
+    def _user_messages(self, user_text: str, images: Any, files: Any) -> List[Dict[str, Any]]:
+        """Собирает сообщения пользователя с вложениями (внутренний метод)."""
+        image_ids = [self._resolve_file(x) for x in self._as_list(images)]
+        doc_ids = [self._resolve_file(x) for x in self._as_list(files)]
+        if len(image_ids) > self.MAX_IMAGES:
+            raise ValueError(f"❌ Слишком много изображений: {len(image_ids)} (максимум {self.MAX_IMAGES})")
+        for fid in image_ids:
+            self._image_ids.add(fid)
+        self.last_files = image_ids + doc_ids
+
+        messages = []
+        for number, fid in enumerate(image_ids[:-1], 1):   # В одном сообщении — только одно изображение
+            messages.append({"role": "user", "content": f"Изображение {number}:", "attachments": [fid]})
+        final: Dict[str, Any] = {"role": "user", "content": user_text}
+        attachments = (image_ids[-1:] if image_ids else []) + doc_ids
+        if attachments:
+            final["attachments"] = attachments
+        messages.append(final)
+        return messages
+
+    def _limit_images(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Убирает самые старые изображения, если их больше лимита (внутренний метод)."""
+        total = sum(1 for m in messages for a in m.get("attachments", []) if a in self._image_ids)
+        excess = total - self.MAX_IMAGES
+        if excess <= 0:
+            return messages
+        result = []
+        for message in messages:
+            attachments = message.get("attachments")
+            if excess > 0 and attachments:
+                kept = []
+                for a in attachments:
+                    if a in self._image_ids and excess > 0:
+                        excess -= 1
+                    else:
+                        kept.append(a)
+                message = {k: v for k, v in message.items() if k != "attachments"}
+                if kept:
+                    message["attachments"] = kept
+            result.append(message)
+        return result
+
+    def _build_payload(self, user_text: str, system_text: str, temperature: float, max_tokens: int,
+                       model: Optional[str], top_p: Optional[float], repetition_penalty: Optional[float],
+                       images: Any, files: Any, use_history: bool, response_format: Optional[Dict],
+                       function_call: Any, extra: Optional[Dict]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        """Собирает тело запроса chat/completions (внутренний метод)."""
+        turn = self._user_messages(user_text, images, files)
+        messages: List[Dict[str, Any]] = []
+        system = system_text or self.system_prompt
+        if system:
+            messages.append({"role": "system", "content": system})
+        if use_history:
+            messages.extend(self.history)
+        messages.extend(turn)
+
+        payload: Dict[str, Any] = {
+            "model": model or self.model,
+            "messages": self._limit_images(messages),
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if top_p is not None:
+            payload["top_p"] = top_p
+        if repetition_penalty is not None:
+            payload["repetition_penalty"] = repetition_penalty
+        if response_format:
+            payload["response_format"] = response_format
+        if function_call is None and len([a for m in turn for a in m.get("attachments", [])
+                                          if a not in self._image_ids]) > 1:
+            function_call = "auto"            # Несколько документов учитываются только с function_call=auto
+        if function_call:
+            payload["function_call"] = function_call
+        if extra:
+            payload.update(extra)
+        return payload, turn
+
+    def _remember(self, turn: List[Dict[str, Any]], answer: str) -> None:
+        """Добавляет обмен репликами в память диалога (внутренний метод)."""
+        self.history.extend(turn)
+        self.history.append({"role": "assistant", "content": answer})
+        if self.max_history and len(self.history) > self.max_history:
+            self.history = self.history[-self.max_history:]
+        while self.history and self.history[0]["role"] != "user":
+            self.history.pop(0)
+
+    def _complete(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Отправляет chat/completions и возвращает полный ответ (внутренний метод)."""
+        resp = self._request("POST", "/chat/completions", json_body=payload)
+        data = resp.json()
+        if not data.get("choices"):
+            raise GigaChatError(f"GigaChat вернул ответ без choices: {data}", resp.status_code, resp.text)
+        self.last_response = data
+        self.last_usage = data.get("usage")
+        return data
+
+    # ---------- Чат ----------
+
+    def chat(self, user_text: str, system_text: str = "", temperature: float = 0.7, max_tokens: int = 500,
+             *, model: Optional[str] = None, top_p: Optional[float] = None,
+             repetition_penalty: Optional[float] = None, images: Any = None, files: Any = None,
+             history: Optional[bool] = None, response_format: Optional[Dict] = None,
+             function_call: Any = None, extra: Optional[Dict] = None) -> str:
+        """
+        💬 ОТПРАВКА СООБЩЕНИЯ НЕЙРОСЕТИ И ПОЛУЧЕНИЕ ОТВЕТА
+
+        Параметры:
+            user_text (str): Текст пользователя
+            system_text (str): Системный промпт (инструкция для модели). Если пусто — берётся self.system_prompt
+            temperature (float): Креативность (0.0 — точный, 1.0 — творческий)
+            max_tokens (int): Максимальная длина ответа в токенах
+            model (str, optional): Модель для этого запроса (по умолчанию self.model)
+            top_p (float, optional): Ядерная выборка от 0 до 1 (альтернатива temperature)
+            repetition_penalty (float, optional): Штраф за повторы (1.0 — нейтрально, больше — меньше повторов)
+            images (str или list, optional): Изображение: путь к файлу, ссылка http(s) или ID уже загруженного файла.
+                                             Можно списком (до 10).
+            files (str или list, optional): Документы (txt, pdf, docx, xlsx...), аналогично images
+            history (bool, optional): Использовать память диалога (None — как задано в remember)
+            response_format (dict, optional): Структурированный ответ, например
+                                              {"type": "json_schema", "schema": {...}, "strict": False}
+            function_call (str или dict, optional): 'auto', 'none' или {"name": "..."} (работа с функциями)
+            extra (dict, optional): Любые дополнительные поля тела запроса (functions и т.п.)
+
+        Возвращает:
+            str: Ответ нейросети
+
+        Исключения:
+            GigaChatError: Если сервер вернул ошибку.
+            FileNotFoundError: Если файл для images/files не найден.
+
+        Пример:
+            >>> ai = GigaChat()
+            >>> reply = ai.chat("Напиши стих про Python", temperature=0.8)
+            >>> print(reply)
+            >>> ai.chat("Что на фото?", images="photo.jpg", model="GigaChat-2-Max")
+            >>> print(ai.last_usage)   # {'prompt_tokens': ..., 'completion_tokens': ..., ...}
+
+        Примечание:
+            Одно сообщение может содержать только одно изображение, поэтому несколько картинок
+            уходят отдельными сообщениями (для нескольких изображений это не проверено на реальном API).
+            Несколько документов за раз учитываются только при function_call='auto' — он ставится сам.
+        """
+        use_history = self.remember if history is None else history
+        payload, turn = self._build_payload(user_text, system_text, temperature, max_tokens, model, top_p,
+                                            repetition_penalty, images, files, use_history,
+                                            response_format, function_call, extra)
+        data = self._complete(payload)
+        answer = data["choices"][0]["message"].get("content", "")
+        if use_history:
+            self._remember(turn, answer)
+        return answer
+
+    def chat_stream(self, user_text: str, system_text: str = "", temperature: float = 0.7,
+                    max_tokens: int = 500, *, model: Optional[str] = None, top_p: Optional[float] = None,
+                    repetition_penalty: Optional[float] = None, update_interval: float = 0,
+                    images: Any = None, files: Any = None, history: Optional[bool] = None,
+                    extra: Optional[Dict] = None) -> Any:
+        """
+        ⚡ ПОТОКОВЫЙ ОТВЕТ — ТЕКСТ ПРИХОДИТ КУСОЧКАМИ ПО МЕРЕ ГЕНЕРАЦИИ
+
+        Параметры:
+            user_text, system_text, temperature, max_tokens, model, top_p, repetition_penalty,
+            images, files, history, extra: Как в chat()
+            update_interval (float): Минимальный интервал (сек) между отправками токенов (0 — сразу)
+
+        Возвращает:
+            generator[str]: Генератор кусочков текста
+
+        Пример:
+            >>> for piece in ai.chat_stream("Расскажи про роботов"):
+            ...     print(piece, end="", flush=True)
+
+        Примечание:
+            В память диалога ответ попадает после того, как генератор полностью прочитан.
+            Статистика токенов сохраняется в ai.last_usage.
+        """
+        use_history = self.remember if history is None else history
+        payload, turn = self._build_payload(user_text, system_text, temperature, max_tokens, model, top_p,
+                                            repetition_penalty, images, files, use_history,
+                                            None, None, extra)
+        payload["stream"] = True
+        payload["update_interval"] = update_interval
+
+        resp = self._request("POST", "/chat/completions", json_body=payload, stream=True)
+        resp.encoding = "utf-8"
+        parts: List[str] = []
+        try:
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data:"):
+                    continue
+                chunk = line[5:].strip()
+                if chunk == "[DONE]":
+                    break
+                obj = json.loads(chunk)
+                if obj.get("usage"):
+                    self.last_usage = obj["usage"]
+                choices = obj.get("choices") or [{}]
+                piece = (choices[0].get("delta") or {}).get("content") or ""
+                if piece:
+                    parts.append(piece)
+                    yield piece
+        finally:
+            resp.close()
+        if use_history:
+            self._remember(turn, "".join(parts))
+
+    def reset_history(self) -> None:
+        """
+        🧹 ОЧИСТИТЬ ПАМЯТЬ ДИАЛОГА
+
+        Пример:
+            >>> ai = GigaChat(remember=True)
+            >>> ai.chat("Меня зовут Юсуф")
+            >>> ai.reset_history()
+        """
+        self.history = []
+
+    def clean_speech(self, raw_text: str) -> str:
+        """
+        🎤 ОЧИСТКА РАСПОЗНАННОЙ РЕЧИ ОТ ЗАИКАНИЙ И СЛОВ-ПАРАЗИТОВ
+
+        Параметры:
+            raw_text (str): Сырой текст с возможными артефактами
+
+        Возвращает:
+            str: Грамматически правильный русский текст
+
+        Пример:
+            >>> clean = ai.clean_speech("я э-э-э хочу вот типа пиццу")
+            >>> print(clean)  # "Я хочу пиццу"
+
+        Примечание:
+            Внутри отправляет запрос к GigaChat с низкой температурой (0.2).
+            Память диалога не используется и не засоряется.
+        """
+        system_prompt = """
+            Ты — аудио-корректор. Получив текст, который может содержать:
+            - запинки и заикания («э-э-э», «ну-у-у»),
+            - слова-паразиты («вот», «короче», «типа»),
+            - ошибки распознавания речи (шум микрофона).
+
+            Верни ТОЛЬКО чистый, грамматически правильный русский текст.
+            Не добавляй ничего от себя.
+            """
+        return self.chat(
+            user_text=raw_text,
+            system_text=system_prompt,
+            temperature=0.2,
+            max_tokens=200,
+            history=False
+        )
+
+    # ---------- Изображения ----------
+
+    def ask_image(self, question: str, image: Any, *, system_text: str = "", temperature: float = 0.2,
+                  max_tokens: int = 500, model: Optional[str] = None, top_p: Optional[float] = None,
+                  history: Optional[bool] = None, delete_after: bool = False,
+                  extra: Optional[Dict] = None) -> str:
+        """
+        🖼️ ВОПРОС ПО ИЗОБРАЖЕНИЮ
+
+        Параметры:
+            question (str): Вопрос к картинке («Что здесь изображено?», «Сколько людей на фото?»)
+            image (str или list): Путь к файлу, ссылка http(s) или ID загруженного файла (или список до 10)
+            system_text (str): Системный промпт
+            temperature (float): Креативность (для описаний лучше низкая)
+            max_tokens (int): Максимальная длина ответа
+            model (str, optional): Модель (если не «видит» картинку — попробуй более мощную, например 'GigaChat-2-Max')
+            top_p (float, optional): Ядерная выборка
+            history (bool, optional): Использовать память диалога (для уточняющих вопросов к той же картинке)
+            delete_after (bool): Удалить загруженные файлы из хранилища после ответа (не используй с памятью диалога)
+            extra (dict, optional): Дополнительные поля запроса
+
+        Возвращает:
+            str: Ответ нейросети
+
+        Пример:
+            >>> ai = GigaChat(remember=True)
+            >>> print(ai.ask_image("Что на фото?", "cat.jpg"))
+            >>> print(ai.ask_image("А какого он цвета?", "cat.jpg"))   # та же картинка не загружается повторно
+
+        Примечание:
+            Лимиты: изображение до 15 МБ, не больше 10 изображений в запросе. Повторно та же картинка
+            не загружается (ID берётся из кэша).
+        """
+        answer = self.chat(question, system_text=system_text, temperature=temperature,
+                           max_tokens=max_tokens, model=model, top_p=top_p, images=image,
+                           history=history, extra=extra)
+        if delete_after:
+            for file_id in list(self.last_files):
+                self.delete_file(file_id)
+        return answer
+
+    def describe_image(self, image: Any, style: str = "detailed", prompt: Optional[str] = None,
+                       **kwargs) -> str:
+        """
+        👁️ ОПИСАНИЕ ИЗОБРАЖЕНИЯ
+
+        Параметры:
+            image (str или list): Путь к файлу, ссылка http(s) или ID загруженного файла
+            style (str): 'brief' (1-2 предложения), 'detailed' (подробно), 'alt' (alt-текст),
+                         'text' (переписать надписи с картинки), 'objects' (список объектов)
+            prompt (str, optional): Свой запрос вместо готового стиля
+            **kwargs: Параметры ask_image() (model, temperature, max_tokens, delete_after...)
+
+        Возвращает:
+            str: Описание изображения
+
+        Исключения:
+            ValueError: Если указан неизвестный style.
+
+        Пример:
+            >>> print(ai.describe_image("photo.jpg"))
+            >>> print(ai.describe_image("sign.png", style="text"))
+            >>> print(ai.describe_image("room.jpg", prompt="Опиши мебель в комнате"))
+        """
+        if prompt is None:
+            if style not in self.IMAGE_PROMPTS:
+                raise ValueError(f"❌ Неизвестный style '{style}'. Доступны: {', '.join(self.IMAGE_PROMPTS)}")
+            prompt = self.IMAGE_PROMPTS[style]
+        return self.ask_image(prompt, image, **kwargs)
+
+    def generate_image(self, prompt: str, save_path: str = "gigachat_image.jpg", *,
+                       model: Optional[str] = None) -> str:
+        """
+        🎨 ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЯ ПО ТЕКСТУ
+
+        Параметры:
+            prompt (str): Что нарисовать («розовый кот в космосе»)
+            save_path (str): Куда сохранить картинку
+            model (str, optional): Модель (по умолчанию self.model)
+
+        Возвращает:
+            str: Путь к сохранённому изображению
+
+        Исключения:
+            GigaChatError: Если модель не вернула изображение.
+
+        Пример:
+            >>> path = ai.generate_image("уютный робот читает книгу")
+            >>> print(path)
+
+        Примечание:
+            Работает через встроенную функцию генерации (function_call='auto'). ID картинки берётся
+            из тега <img src="..."/> в ответе. Эта функция сделана по документации Сбера и не проверялась
+            на реальном API.
+        """
+        import re
+        text = prompt if "нарису" in prompt.lower() else f"Нарисуй: {prompt}"
+        payload = {"model": model or self.model, "function_call": "auto",
+                   "messages": [{"role": "user", "content": text}]}
+        content = self._complete(payload)["choices"][0]["message"].get("content", "") or ""
+        found = re.search(r'<img[^>]*\bsrc="([^"]+)"', content)
+        if not found:
+            raise GigaChatError(f"Модель не вернула изображение. Ответ: {content[:200]}")
+        return self.download_file(found.group(1), save_path)
+
+    # ---------- Файлы ----------
+
+    def upload_file(self, path: str, purpose: str = "general", reuse: bool = True) -> str:
+        """
+        📤 ЗАГРУЗКА ФАЙЛА В ХРАНИЛИЩЕ GigaChat
+
+        Параметры:
+            path (str): Путь к файлу (изображение до 15 МБ, документ до 40 МБ)
+            purpose (str): Назначение (сейчас только 'general')
+            reuse (bool): Не загружать повторно тот же неизменённый файл
+
+        Возвращает:
+            str: ID файла (его можно передавать в images=/files=)
+
+        Исключения:
+            FileNotFoundError: Если файла нет.
+            ValueError: Если файл больше лимита.
+
+        Пример:
+            >>> file_id = ai.upload_file("report.pdf")
+            >>> ai.chat("Сделай краткое резюме", files=file_id)
+        """
+        import mimetypes
+        file_path = Path(path)
+        if not file_path.is_file():
+            raise FileNotFoundError(f"❌ Файл не найден: {path}")
+        is_image = file_path.suffix.lower() in self.IMAGE_EXTENSIONS
+        size = file_path.stat().st_size
+        limit = self.MAX_IMAGE_BYTES if is_image else self.MAX_FILE_BYTES
+        if size > limit:
+            raise ValueError(f"❌ Файл слишком большой: {size / 1048576:.1f} МБ (лимит {limit // 1048576} МБ)")
+
+        cache_key = (str(file_path.resolve()), size, int(file_path.stat().st_mtime))
+        if reuse and cache_key in self._file_cache:
+            return self._file_cache[cache_key]
+
+        mime = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+        content = file_path.read_bytes()
+        resp = self._request("POST", "/files", files={"file": (file_path.name, content, mime)},
+                             data={"purpose": purpose}, timeout=max(self.timeout, 60))
+        file_id = resp.json()["id"]
+        self._file_cache[cache_key] = file_id
+        if is_image:
+            self._image_ids.add(file_id)
+        return file_id
+
+    def list_files(self) -> List[Dict[str, Any]]:
+        """
+        📂 СПИСОК ЗАГРУЖЕННЫХ ФАЙЛОВ
+
+        Возвращает:
+            List[dict]: Файлы с полями id, filename, bytes, created_at, purpose...
+
+        Пример:
+            >>> for f in ai.list_files():
+            ...     print(f["id"], f["filename"])
+        """
+        return self._request("GET", "/files").json().get("data", [])
+
+    def get_file_info(self, file_id: str) -> Dict[str, Any]:
+        """
+        ℹ️ ИНФОРМАЦИЯ О ФАЙЛЕ
+
+        Параметры:
+            file_id (str): ID файла
+
+        Возвращает:
+            dict: id, filename, bytes, created_at, purpose, access_policy
+
+        Пример:
+            >>> print(ai.get_file_info(file_id)["filename"])
+        """
+        return self._request("GET", f"/files/{file_id}").json()
+
+    def download_file(self, file_id: str, save_path: str) -> str:
+        """
+        📥 СКАЧИВАНИЕ ФАЙЛА ИЗ ХРАНИЛИЩА (например, сгенерированной картинки)
+
+        Параметры:
+            file_id (str): ID файла
+            save_path (str): Куда сохранить
+
+        Возвращает:
+            str: Путь к сохранённому файлу
+
+        Пример:
+            >>> ai.download_file(file_id, "result.jpg")
+        """
+        content = self._request("GET", f"/files/{file_id}/content").content
+        folder = os.path.dirname(os.path.abspath(save_path))
+        os.makedirs(folder, exist_ok=True)
+        with open(save_path, "wb") as handle:
+            handle.write(content)
+        return save_path
+
+    def delete_file(self, file_id: str) -> bool:
+        """
+        🗑️ УДАЛЕНИЕ ФАЙЛА ИЗ ХРАНИЛИЩА
+
+        Параметры:
+            file_id (str): ID файла
+
+        Возвращает:
+            bool: True, если файл удалён
+
+        Пример:
+            >>> ai.delete_file(file_id)
+        """
+        result = self._request("POST", f"/files/{file_id}/delete").json()
+        self._image_ids.discard(file_id)
+        self._file_cache = {k: v for k, v in self._file_cache.items() if v != file_id}
+        return bool(result.get("deleted", False))
+
+    # ---------- Служебные функции ----------
+
+    def count_tokens(self, text: Union[str, List[str]], model: Optional[str] = None) -> Union[int, List[int]]:
+        """
+        🔢 ПОДСЧЁТ ТОКЕНОВ В ТЕКСТЕ
+
+        Параметры:
+            text (str или list): Текст или список текстов
+            model (str, optional): Модель (у разных моделей токенизация может отличаться)
+
+        Возвращает:
+            int или List[int]: Число токенов (число для строки, список для списка)
+
+        Пример:
+            >>> print(ai.count_tokens("Привет, как дела?"))
+            >>> print(ai.count_tokens(["раз", "два три"]))
+        """
+        texts = [text] if isinstance(text, str) else list(text)
+        data = self._request("POST", "/tokens/count",
+                             json_body={"model": model or self.model, "input": texts}).json()
+        items = data if isinstance(data, list) else data.get("data", [])
+        counts = [int(item["tokens"]) for item in items]
+        return counts[0] if isinstance(text, str) else counts
+
+    def get_balance(self) -> Dict[str, int]:
+        """
+        💰 ОСТАТОК ТОКЕНОВ
+
+        Возвращает:
+            dict: {"GigaChat": 1000000, ...} — остаток токенов по моделям
+
+        Исключения:
+            GigaChatError: Если метод недоступен (при оплате pay-as-you-go сервер отвечает 403).
+
+        Пример:
+            >>> print(ai.get_balance())
+        """
+        data = self._request("GET", "/balance").json()
+        return {item["usage"]: item["value"] for item in data.get("balance", [])}
+
+    def list_models(self, kind: Optional[str] = "chat") -> List[str]:
+        """
+        📜 СПИСОК ДОСТУПНЫХ МОДЕЛЕЙ
+
+        Параметры:
+            kind (str, optional): Тип: 'chat' (чат), 'embedder' (эмбеддинги), 'aicheck'. None — все
+
+        Возвращает:
+            List[str]: Названия моделей (значения для параметра model)
+
+        Пример:
+            >>> print(ai.list_models())
+            >>> ai.model = ai.list_models()[0]
+        """
+        data = self._request("GET", "/models").json().get("data", [])
+        return [m["id"] for m in data if kind is None or m.get("type") == kind]
+
+    def embeddings(self, texts: Union[str, List[str]], model: str = "Embeddings") -> List[List[float]]:
+        """
+        🧬 ЭМБЕДДИНГИ (ВЕКТОРНОЕ ПРЕДСТАВЛЕНИЕ ТЕКСТА)
+
+        Параметры:
+            texts (str или list): Текст или список текстов
+            model (str): 'Embeddings', 'Embeddings-2' или 'EmbeddingsGigaR'
+
+        Возвращает:
+            List[List[float]]: Вектор для каждого текста (в том же порядке)
+
+        Пример:
+            >>> vectors = ai.embeddings(["кошка", "собака"])
+            >>> print(len(vectors), len(vectors[0]))
+        """
+        items = [texts] if isinstance(texts, str) else list(texts)
+        data = self._request("POST", "/embeddings", json_body={"model": model, "input": items}).json()
+        rows = sorted(data.get("data", []), key=lambda row: row.get("index", 0))
+        return [row["embedding"] for row in rows]
 
 
 # =============================================================================
@@ -2927,7 +5852,7 @@ class ScreenReader:
         return pixel
 
     @staticmethod
-    def find_text_coordinates(search_text: str, languages: List[str] = ['en', 'ru'],
+    def find_text_coordinates(search_text: str, languages: Optional[List[str]] = None,
                               monitor_index: int = 1, confidence_threshold: float = 0.5,
                               partial_match: bool = True) -> Dict[str, Any]:
         """
@@ -2947,6 +5872,8 @@ class ScreenReader:
         import numpy as np
         from PIL import Image
 
+        if languages is None:
+            languages = ['en', 'ru']
         reader = ScreenReader._get_ocr_reader(languages)
         with mss.mss() as sct:
             monitor = sct.monitors[monitor_index]
