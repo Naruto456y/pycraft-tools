@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 
 BASE_DIR = Path(__file__).resolve().parent
-MODEL_DIR = Path.home() / ".cache" / "pycraft_tools" / "gigaam"
+MODEL_DIR = BASE_DIR / "models" / "gigaam"
 MARKER = MODEL_DIR / ".downloaded"
 MODEL_NAME = "gigaam-v3-e2e-ctc"   # e2e: пунктуация и числа цифрами ("громкость 50")
 QUANTIZATION = "int8"              # ~225 МБ

@@ -59,10 +59,7 @@ class GigaAMEngine(Engine):
     name = "gigaam"
 
     def __init__(self, **kwargs):
-        try:
-            from neural_networks.gigaam import GigaAMRecognizer
-        except ImportError:
-            from ..neural_networks.gigaam import GigaAMRecognizer
+        from .gigaam_engine import GigaAMRecognizer
         self._rec = GigaAMRecognizer(**kwargs)
 
     def listen(self, timeout=5, phrase_limit=5):

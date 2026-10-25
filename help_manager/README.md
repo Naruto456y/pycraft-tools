@@ -80,6 +80,42 @@
 pip install pycraft-tools
 ```
 
+Код всех модулей PyCraft приходит в одном пакете. Если для модуля нужны свои зависимости, поставьте их через extras (см. ниже), иначе импорт подскажет, чего не хватает:
+
+```python
+import help_manager
+import ai_modules            # GigaChat и другие нейросети
+import voice_recognition     # Google, Vosk, GigaAM
+import yandex_music_tools    # скачивание лайков Яндекс.Музыки
+import yandex_smart_home     # Умный дом Яндекса
+import makerzoid_robot       # робот Makerzoid по Bluetooth
+import mosru_diary           # дневник МЭШ
+```
+
+Зависимости отдельных модулей ставятся по имени модуля в квадратных скобках:
+
+```bash
+pip install pycraft-tools[makerzoid_robot]     # bleak, python-dotenv
+pip install pycraft-tools[voice_recognition]   # pyaudio, vosk, tqdm, onnx-asr
+pip install pycraft-tools[mosru_diary]         # requests, playwright
+pip install pycraft-tools[yandex_smart_home]   # python-dotenv, flask
+pip install pycraft-tools[yandex_music_tools]  # yandex-music
+pip install pycraft-tools[ai_modules]          # requests
+pip install pycraft-tools[all]                 # зависимости всех модулей сразу
+```
+
+Можно несколько сразу: `pip install pycraft-tools[makerzoid_robot,mosru_diary]`.
+
+| Модуль | Что внутри |
+|---|---|
+| `help_manager` | главный модуль: Manager, Music, Auto, Face, BazaDB и другие |
+| `ai_modules` | GigaChat и другие нейросети |
+| `voice_recognition` | распознавание речи: Google, Vosk, GigaAM |
+| `yandex_music_tools` | скачивание лайков Яндекс.Музыки |
+| `yandex_smart_home` | Умный дом Яндекса |
+| `makerzoid_robot` | робот Makerzoid по Bluetooth |
+| `mosru_diary` | дневник МЭШ (есть консольная команда `mosru-diary`) |
+
 ## 🚀 Быстрый старт
 
 ```python

@@ -68,7 +68,10 @@
 import os
 import asyncio
 import threading
-from bleak import BleakClient
+try:
+    from bleak import BleakClient
+except ImportError as e:
+    raise ImportError("Для робота Makerzoid нужен bleak: pip install pycraft-tools[makerzoid_robot]") from e
 
 
 # --- НАСТРОЙКИ ПО УМОЛЧАНИЮ ---
