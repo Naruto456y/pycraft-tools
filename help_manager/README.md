@@ -1,6 +1,6 @@
 ﻿# 🛠️ pycraft-tools — «швейцарский нож» для Python
 
-Один пакет, в котором лежат **семь модулей**: главный `help_manager` (голос, музыка, автоматизация, база данных, экран, файлы, консоль) и шесть специальных: нейросети, распознавание речи, Яндекс.Музыка, умный дом Яндекса, робот Makerzoid и дневник МЭШ.
+Один пакет, в котором лежат **восемь модулей**: главный `help_manager` (голос, музыка, автоматизация, база данных, экран, файлы, консоль) и семь специальных: нейросети, распознавание речи, Яндекс.Музыка, умный дом Яндекса, Алиса (ТВ и колонки), робот Makerzoid и дневник МЭШ.
 
 ```bash
 pip install pycraft-tools
@@ -44,6 +44,7 @@ pip install pycraft-tools[all]                 # зависимости всех
 | `voice_recognition` | распознавание речи: Google, Vosk, GigaAM | `[voice_recognition]` |
 | `yandex_music_tools` | скачать «Мне нравится» из Яндекс.Музыки | `[yandex_music_tools]` |
 | `yandex_smart_home` | лампы, группы, сценарии Умного дома Яндекса | `[yandex_smart_home]` |
+| `yandex_alice` | Яндекс ТВ и колонки с Алисой по Wi-Fi: голос, приложения, плеер, громкость | `[yandex_alice]` |
 | `makerzoid_robot` | робот Makerzoid по Bluetooth LE | `[makerzoid_robot]` |
 | `mosru_diary` | домашка, оценки, расписание из МЭШ | `[mosru_diary]` |
 
@@ -334,6 +335,38 @@ except SmartHomeError as e:
 ```
 
 Веб-панель: `python -m yandex_smart_home.smart_home_web` (нужен extra `[yandex_smart_home]`). Панель без пароля, держите её только в домашней сети.
+
+---
+
+## 🗣️ yandex_alice: Яндекс ТВ и колонки
+
+Команды идут напрямую в устройство по локальному протоколу Glagol (`wss://IP:1961`), ноутбук и устройство должны быть в одной Wi-Fi сети. Нужен токен **Яндекс Музыки** (токен умного дома не подходит), получить: [oauth.yandex.ru](https://oauth.yandex.ru/authorize?response_type=token&client_id=23cabbbdc6cd418abb4b39c32c41195d).
+
+```
+GLAGOL_TOKEN=y0_...
+```
+
+```python
+from dotenv import load_dotenv
+from yandex_alice import Alice, AliceError
+
+load_dotenv()
+alice = Alice()
+
+print(alice.devices)                      # ТВ и колонки в сети
+alice.tv.open_app("YouTube")              # приложение на ТВ
+alice.speaker.say("Ужин готов!")          # произнести фразу
+alice.tv.command("включи канал Пятница")  # любая команда Алисе
+alice.tv.set_volume(30)                   # 0-100 %
+alice.tv.pause(); alice.tv.play()         # плеер: pause/play/next/prev/rewind
+print(alice.speaker.get_state())          # громкость, играет ли, название трека
+alice.say_everywhere("Всем привет!")      # на всех устройствах
+
+try:
+    alice.device("Кухня").say("Привет")
+except AliceError as e:
+    print("Не вышло:", e)
+```
 
 ---
 

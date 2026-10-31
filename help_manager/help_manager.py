@@ -176,22 +176,79 @@ class Manager:
             return ""
 
     @staticmethod
-    def say(text: str, lang: str = 'ru') -> None:
+    def say(text: str, lang: str = 'ru', voice: str = 'default') -> None:
         """
         🔊 ОЗВУЧКА ТЕКСТА (TTS) — ПРЕВРАЩАЕТ ТЕКСТ В РЕЧЬ
 
         Параметры:
             text (str): Текст для озвучивания
             lang (str): Язык ('ru' — русский, 'en' — английский, и т.д.)
+            voice (str): Голос: 'default' — обычный (Google TTS), 'jarvis' — клон голоса Джарвиса (XTTS-v2, офлайн)
 
         Пример:
             >>> Manager.say("Привет, я твой помощник!")
             >>> Manager.say("Hello, world!", lang='en')
+            >>> Manager.say("Приветствую, сэр.", voice='jarvis')
 
         Примечание:
-            Используется Google TTS и pydub. Требуется интернет.
-            Временные файлы автоматически удаляются.
+            default: Google TTS и pydub, нужен интернет. Временные файлы автоматически удаляются.
+            jarvis: фоновый сервер server.py из папки JARVIS_TTS_DIR (по умолчанию projects\\jarvis_tts)
+            в её отдельном окружении .venv. Первый вызов сам запускает сервер (~15-30 с на загрузку модели),
+            дальше фразы озвучиваются за 1-2 с. Сервер сам выключается после 30 минут простоя.
+            Аудио сохраняется в jarvis_tts\\output.
         """
+        if voice.lower() == 'jarvis':
+            import json as _json
+            port = int(os.environ.get('JARVIS_TTS_PORT', '47777'))
+
+            def _ask(req: dict, timeout: float) -> dict:
+                with socket.create_connection(('127.0.0.1', port), timeout=timeout) as s:
+                    s.settimeout(timeout)
+                    s.sendall((_json.dumps(req, ensure_ascii=False) + '\n').encode('utf-8'))
+                    buf = b''
+                    while not buf.endswith(b'\n'):
+                        chunk = s.recv(65536)
+                        if not chunk:
+                            break
+                        buf += chunk
+                return _json.loads(buf.decode('utf-8'))
+
+            try:
+                _ask({'ping': True}, 2)
+            except OSError:
+                # Закрытый порт здесь отвечает таймаутом, а не отказом, поэтому «жив ли сервер»
+                # определяем по pid-файлу, который пишет сам server.py
+                tts_dir = os.environ.get('JARVIS_TTS_DIR') or r'C:\Users\Yusuf\Programming\Python\projects\jarvis_tts'
+                alive = False
+                try:
+                    with open(os.path.join(tts_dir, 'server.pid')) as f:
+                        pid = f.read().strip()
+                    alive = pid in subprocess.run(['tasklist', '/FI', f'PID eq {pid}', '/NH'],
+                                                  capture_output=True, text=True).stdout
+                except OSError:
+                    pass
+                if not alive:
+                    py = os.path.join(tts_dir, '.venv', 'Scripts', 'python.exe')
+                    if not os.path.exists(py):
+                        raise FileNotFoundError(f"❌ Не найден Jarvis TTS: {py}. Задай путь через JARVIS_TTS_DIR")
+                    log = open(os.path.join(tts_dir, 'server.log'), 'a', encoding='utf-8')
+                    subprocess.Popen([py, os.path.join(tts_dir, 'server.py')], cwd=tts_dir, stdout=log, stderr=log,
+                                     creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS)
+                deadline = time.time() + 180
+                while True:
+                    try:
+                        _ask({'ping': True}, 2)
+                        break
+                    except OSError:
+                        if time.time() > deadline:
+                            raise TimeoutError("❌ Сервер Jarvis TTS не запустился, смотри server.log")
+                        time.sleep(1)
+            resp = _ask({'text': text, 'lang': lang, 'play': True}, 120)
+            if not resp.get('ok'):
+                raise RuntimeError(f"❌ Jarvis TTS: {resp.get('error')}")
+            return
+        if voice.lower() != 'default':
+            raise ValueError(f"❌ Неизвестный голос '{voice}'. Доступны: 'default', 'jarvis'")
         from gtts import gTTS
         from pydub import AudioSegment
         from pydub.playback import play

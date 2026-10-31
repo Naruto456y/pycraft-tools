@@ -32,7 +32,7 @@ class BuildPy(build_py):
 
 setup(
     name="pycraft-tools",
-    version="1.3.1",
+    version="1.4.0",
     author="Yusuf Guseinov",
     author_email="yusufvaleh@gmail.com",
     description="Универсальный помощник на Python: голос, музыка, автоматизация, базы данных, ИИ, умный дом, робот, дневник МЭШ",
@@ -45,6 +45,7 @@ setup(
         "voice_recognition",
         "yandex_music_tools",
         "yandex_smart_home",
+        "yandex_alice",
         "makerzoid_robot",
         "mosru_diary",
     ],
@@ -102,8 +103,9 @@ setup(
         "voice_recognition": ["pyaudio", "vosk", "tqdm", "onnx-asr"],     # микрофон, Vosk, GigaAM
         "yandex_music_tools": ["yandex-music"],
         "yandex_smart_home": ["python-dotenv", "flask"],                   # flask: веб-панель
+        "yandex_alice": ["websocket-client", "python-dotenv"],             # Glagol: ТВ и колонки
         "makerzoid_robot": ["bleak", "python-dotenv"],
         "mosru_diary": ["requests", "playwright"],                         # playwright: обновление токена
-        "all": ["pyaudio", "vosk", "tqdm", "onnx-asr", "flask", "bleak", "playwright"],
+        "all": ["pyaudio", "vosk", "tqdm", "onnx-asr", "flask", "websocket-client", "bleak", "playwright"],
     },
 )
