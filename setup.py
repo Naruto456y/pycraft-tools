@@ -5,7 +5,7 @@ from setuptools.command.build_py import build_py
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-with open(os.path.join(HERE, "help_manager", "README.md"), "r", encoding="utf-8") as f:
+with open(os.path.join(HERE, "README.md"), "r", encoding="utf-8") as f:
     long_description = f.read()
 
 

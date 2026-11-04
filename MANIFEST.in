@@ -1,3 +1,3 @@
 include LICENSE
-include help_manager/README.md
+include README.md
 include help_manager/help_manager.py
