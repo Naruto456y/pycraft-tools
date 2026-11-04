@@ -1,0 +1,4 @@
+requests
+python-dotenv
+# только для веб-панели smart_home_web.py
+flask

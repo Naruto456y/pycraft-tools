@@ -1,0 +1,12 @@
+.session/
+*.json
+!track_cache.json
+homework_files/
+homework_out/
+__pycache__/
+*.pyc
+dist/
+build/
+*.egg-info/
+.mosru_diary/
+yandex_profile/

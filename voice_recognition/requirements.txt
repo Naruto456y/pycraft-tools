@@ -1,0 +1,9 @@
+SpeechRecognition
+pyaudio
+# движок vosk
+vosk
+requests
+tqdm
+# движок gigaam
+onnx-asr
+numpy
