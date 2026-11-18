@@ -32,7 +32,7 @@ class BuildPy(build_py):
 
 setup(
     name="pycraft-tools",
-    version="1.5.0",
+    version="1.5.1",
     author="Yusuf Guseinov",
     author_email="yusufvaleh@gmail.com",
     description="Универсальный помощник на Python: голос, музыка, автоматизация, базы данных, ИИ, умный дом, робот, дневник МЭШ",

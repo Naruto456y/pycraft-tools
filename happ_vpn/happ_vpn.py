@@ -20,8 +20,8 @@
         - статус читается из процессов и реестра HKCU\\Software\\Happ
         - подписки — из лога Happ (ссылки наружу НЕ выводятся)
         - сервер переключается через реестр + перезапуск Happ
-      🧪 switch() экспериментальный: перед ним сервер нужно «выучить» —
-      один раз выбрать его в Happ и вызвать remember().
+      🔄 switch() проверен: смена страны занимает ~18 секунд. Перед ним сервер
+      нужно «выучить» — один раз выбрать его в Happ и вызвать remember().
 
    🔑 Токены не нужны: всё берётся из установленного Happ.
       Модуль работает только на Windows, зависимостей нет (stdlib).
@@ -195,7 +195,7 @@ class Happ:
       - open() / close()    — показать окно / закрыть Happ
       - remember()          — запомнить текущий сервер для switch()
       - servers()           — список выученных серверов
-      - switch(name)        — переключиться на сервер (🧪 через реестр + перезапуск)
+      - switch(name)        — переключиться на сервер (реестр + перезапуск Happ)
       - next()              — следующий выученный сервер
       - backup()            — бэкап настроек Happ в .reg
     """
@@ -368,8 +368,9 @@ class Happ:
         self._deeplink("close")
         if self._wait(lambda: "happ.exe" not in self._processes(), timeout):
             return
-        # 🔨 вежливо не вышло — просим Windows закрыть окно
-        subprocess.run(["taskkill", "/IM", "Happ.exe"], capture_output=True)
+        # 🔨 Happ сворачивается в трей и не закрывается ни по happ://close, ни по WM_CLOSE,
+        # поэтому завершаем окно принудительно (служба HappService остаётся работать)
+        subprocess.run(["taskkill", "/F", "/IM", "Happ.exe"], capture_output=True)
         if not self._wait(lambda: "happ.exe" not in self._processes(), timeout):
             raise HappError("⏳ Happ не закрылся. Закрой его вручную из трея")
 
@@ -425,9 +426,9 @@ class Happ:
         return list(self._load_servers())
 
     def switch(self, name, connect=True):
-        """🔄 Переключиться на сервер по имени (🧪 экспериментально).
+        """🔄 Переключиться на сервер по имени (~18 секунд без VPN).
 
-        Что происходит: бэкап реестра → Happ закрывается → в реестр
+        Что происходит: бэкап реестра → окно Happ завершается → в реестр
         пишется выбранный сервер → Happ запускается → connect().
         VPN пропадает на несколько секунд.
 
