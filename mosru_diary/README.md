@@ -56,6 +56,7 @@ d.snapshot()                          # всё сразу для ежеднев�
 python mosru_diary.py --data-dir .session homework --days 7 --files
 python mosru_diary.py --data-dir .session school-day    # код возврата 0 = учебный день, 10 = нет
 python mosru_diary.py --data-dir .session marks
+python mosru_diary.py --data-dir .session menu --date 2026-11-05   # меню столовой
 python mosru_diary.py --data-dir .session snapshot --save snapshot.json
 python mosru_diary.py --data-dir .session login          # ручной вход
 ```

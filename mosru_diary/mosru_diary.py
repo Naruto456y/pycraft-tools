@@ -192,7 +192,8 @@ class MosRuDiary:
         args = [self._find_browser(), f"--remote-debugging-port={self.cdp_port}",
                 f"--user-data-dir={self.profile_dir}"]
         if not visible:
-            args.append("--start-minimized")
+            # окно уезжает за экран: не мелькает и не сворачивается (куки/профиль как у обычного окна)
+            args += ["--window-position=-32000,-32000", "--window-size=1200,800"]
         subprocess.Popen(args)
         for _ in range(40):
             if self._cdp_alive():
@@ -733,6 +734,36 @@ class MosRuDiary:
             "orders": orders.get("orders", []),
         }
 
+    def menu(self, start: DateLike = None, end: DateLike = None) -> list:
+        """
+        Меню школьной столовой (только чтение): по дням комплексы (завтрак, обед,
+        полдник) с ценой и блюдами. Ничего не заказывает.
+        Цена price_rub в рублях; у льготного питания она показывает полную стоимость.
+        """
+        pid = json.dumps({"personId": self.ids["person_id"]}, separators=(",", ":"))
+        s = _to_date(start)
+        e = _to_date(end, s)
+        days = self._get("/api/food/meals/v3/menu/complexes", {
+            "clientId": pid, "from": s.isoformat(), "to": e.isoformat(), "withPreorder": "in"})
+        result = []
+        for day in days or []:
+            complexes = []
+            for c in day.get("items", []):
+                dishes = []
+                for ci in c.get("complexItems", []):
+                    dsh = ci.get("dish") or {}
+                    dishes.append({
+                        "name": dsh.get("name"), "weight": dsh.get("weight"),
+                        "calories": dsh.get("calories"), "protein": dsh.get("protein"),
+                        "fat": dsh.get("fat"), "carbohydrates": dsh.get("carbohydrates"),
+                        "ingredients": dsh.get("ingredients"),
+                    })
+                complexes.append({"name": c.get("name"), "kind": c.get("kind"),
+                                  "price_rub": round(c["price"] / 100, 2) if c.get("price") is not None else None,
+                                  "dishes": dishes})
+            result.append({"date": day.get("onDate"), "complexes": complexes})
+        return result
+
     # ------------------------------------------------------------------
     # 📦 ВСЁ СРАЗУ
     # ------------------------------------------------------------------
@@ -764,6 +795,7 @@ class MosRuDiary:
             "rating": safe(self.rating),
             "attendance_week": safe(self.attendance),
             "food": safe(self.food),
+            "menu_today_tomorrow": safe(lambda: self.menu(today, today + timedelta(days=1))),
         }
 
 
@@ -811,6 +843,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     sub.add_parser("rating", help="место в рейтинге класса")
     sub.add_parser("attendance", help="посещаемость за неделю")
     sub.add_parser("food", help="питание: баланс, лимит, заказы")
+    p = sub.add_parser("menu", help="меню столовой на день")
+    p.add_argument("--date", help="ГГГГ-ММ-ДД (по умолчанию сегодня)")
     sub.add_parser("tests", help="контрольные и проверочные")
     sub.add_parser("school", help="школа, учителя")
     sub.add_parser("events", help="события школы")
@@ -866,6 +900,17 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print(f"Всего оценок: {o['count']}, средний балл: {o['average']} (простой {o.get('average_plain')})")
                 for name, st in s["subjects"].items():
                     print(f"  {name:<34} {st['count']:>3} шт.  ср. {st['average']}  {st['distribution']}")
+        elif args.cmd == "menu":
+            rows = d.menu(start=args.date)
+            if args.json:
+                out(rows)
+            else:
+                for day in rows:
+                    print(day["date"])
+                    for c in day["complexes"]:
+                        print(f"  {c['name']}  {c['price_rub']} ₽")
+                        for x in c["dishes"]:
+                            print(f"    - {x['name']} ({x['weight']} г, {x['calories']} ккал)")
         elif args.cmd == "snapshot":
             snap = d.snapshot(days=args.days, back=args.back, files=args.files)
             if args.save:
