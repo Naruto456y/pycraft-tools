@@ -2,7 +2,7 @@
 import importlib
 
 _PACKAGES = ("yandex_smart_home", "yandex_alice", "makerzoid_robot", "yandex_music_tools",
-             "voice_recognition", "ai_modules", "mosru_diary")
+             "voice_recognition", "ai_modules", "mosru_diary", "happ_vpn")
 
 
 def __getattr__(name):

@@ -32,7 +32,7 @@ class BuildPy(build_py):
 
 setup(
     name="pycraft-tools",
-    version="1.4.0",
+    version="1.5.0",
     author="Yusuf Guseinov",
     author_email="yusufvaleh@gmail.com",
     description="Универсальный помощник на Python: голос, музыка, автоматизация, базы данных, ИИ, умный дом, робот, дневник МЭШ",
@@ -48,8 +48,10 @@ setup(
         "yandex_alice",
         "makerzoid_robot",
         "mosru_diary",
+        "happ_vpn",
     ],
-    entry_points={"console_scripts": ["mosru-diary=mosru_diary.mosru_diary:main"]},
+    entry_points={"console_scripts": ["mosru-diary=mosru_diary.mosru_diary:main",
+                                    "happ-vpn=happ_vpn.happ_vpn:main"]},
     cmdclass={"build_py": BuildPy},
     classifiers=[
         "Programming Language :: Python :: 3",
@@ -106,6 +108,7 @@ setup(
         "yandex_alice": ["websocket-client", "python-dotenv"],             # Glagol: ТВ и колонки
         "makerzoid_robot": ["bleak", "python-dotenv"],
         "mosru_diary": ["requests", "playwright"],                         # playwright: обновление токена
+        "happ_vpn": [],                                                    # только стандартная библиотека, Windows
         "all": ["pyaudio", "vosk", "tqdm", "onnx-asr", "flask", "websocket-client", "bleak", "playwright"],
     },
 )
